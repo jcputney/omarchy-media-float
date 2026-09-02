@@ -2,11 +2,13 @@
   "schemaVersion": 1,
   "id": "io.github.jcputney.media-float-twitch",
   "name": "Twitch Float",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "author": "jcputney",
   "license": "MIT",
   "description": "Browse your live Twitch follows, categories and top channels in a native overlay, and play the pick in a floating, pinned mpv window.",
-  "kinds": ["overlay"],
+  "kinds": [
+    "overlay"
+  ],
   "entryPoints": {
     "overlay": "Picker.qml"
   }
