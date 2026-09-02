@@ -1,0 +1,143 @@
+# Fans this repo out to the three published plugin repos.
+#
+# Tag a release here and each plugin repo gets a matching commit and tag:
+#
+#     git tag v0.2.0 && git push origin v0.2.0
+#
+# The plugin repos are plain mirrors — never commit to them directly, or the
+# next release will overwrite it.
+
+name: Publish plugin repos
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build and diff, but do not push"
+        type: boolean
+        default: true
+
+# Two releases racing would interleave commits in the mirrors.
+concurrency:
+  group: publish-plugin-repos
+  cancel-in-progress: false
+
+# For this repo only, and only what actions/checkout needs. The push to the
+# other three repos uses PLUGIN_PUSH_TOKEN — GITHUB_TOKEN cannot reach them
+# however this block is written.
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Work out the version
+        id: version
+        run: |
+          if [[ $GITHUB_REF == refs/tags/* ]]; then
+            version="${GITHUB_REF#refs/tags/v}"
+            echo "tagged=true" >> "$GITHUB_OUTPUT"
+          else
+            version=""
+            echo "tagged=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Publishing ${version:-<untagged>}"
+
+      # A tag that disagrees with the manifests would ship plugins labelled with
+      # the wrong version, and the shell shows that label. Catch it before the
+      # mirrors are touched, not after.
+      - name: Check the manifests match the tag
+        if: steps.version.outputs.tagged == 'true'
+        env:
+          WANT: ${{ steps.version.outputs.version }}
+        run: |
+          want="$WANT"
+          bad=0
+          for slug in plex twitch youtube; do
+            got=$(jq -r '.version' "$slug/manifest.json")
+            if [[ $got != "$want" ]]; then
+              echo "::error file=$slug/manifest.json::version is $got, tag says $want"
+              bad=1
+            fi
+          done
+          if (( bad )); then
+            echo "Bump them together, then retag:"
+            echo "  for f in */manifest.json; do jq --arg v \"$want\" '.version=\$v' \"\$f\" | sponge \"\$f\"; done"
+            exit 1
+          fi
+
+      - name: Build the plugin repos
+        run: |
+          # omarchy-plugin-validate is not on a runner; publish skips it when
+          # absent and still runs the bash syntax checks.
+          tools/publish
+
+      # Validation is the whole point of the mirror being installable, so run
+      # the real checks here rather than trusting the local build.
+      - name: Validate each built plugin
+        run: |
+          for d in dist/*/; do
+            jq -e '.schemaVersion == 1' "$d/manifest.json" > /dev/null
+            for field in id name version kinds entryPoints; do
+              jq -e --arg f "$field" 'has($f)' "$d/manifest.json" > /dev/null \
+                || { echo "::error::$d manifest missing $field"; exit 1; }
+            done
+            ep=$(jq -r '.entryPoints.overlay' "$d/manifest.json")
+            [[ -f "$d/$ep" ]] || { echo "::error::$d missing entry point $ep"; exit 1; }
+            if link=$(find "$d" -type l -print -quit) && [[ -n $link ]]; then
+              echo "::error::$d contains a symlink: $link"; exit 1
+            fi
+            echo "ok $d"
+          done
+
+      - name: Push to the plugin repos
+        env:
+          GH_TOKEN: ${{ secrets.PLUGIN_PUSH_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+          TAGGED: ${{ steps.version.outputs.tagged }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          [[ -n ${GH_TOKEN:-} ]] || { echo "::error::PLUGIN_PUSH_TOKEN is not set"; exit 1; }
+
+          for slug in plex twitch youtube; do
+            repo="omarchy-media-float-$slug"
+            work="$RUNNER_TEMP/$repo"
+
+            git clone --quiet \
+              "https://x-access-token:$GH_TOKEN@github.com/${GITHUB_REPOSITORY%%/*}/$repo.git" "$work"
+
+            # --delete so a file dropped from the source tree also leaves the
+            # mirror. Without it, deletions never propagate.
+            rsync -a --delete --exclude .git "dist/$repo/" "$work/"
+
+            git -C "$work" add -A
+            if git -C "$work" diff --cached --quiet; then
+              echo "$repo: no change"
+            else
+              git -C "$work" diff --cached --stat
+              if [[ ${DRY_RUN:-false} == true ]]; then
+                echo "$repo: dry run, not pushing"
+                continue
+              fi
+              git -C "$work" \
+                -c user.name="github-actions[bot]" \
+                -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+                commit -qm "Release ${VERSION:-from $GITHUB_SHA}" \
+                       -m "Built from ${GITHUB_REPOSITORY}@${GITHUB_SHA}"
+              git -C "$work" push --quiet
+              echo "$repo: pushed"
+            fi
+
+            if [[ $TAGGED == true && ${DRY_RUN:-false} != true ]]; then
+              git -C "$work" tag -f "v$VERSION"
+              git -C "$work" push --quiet --force origin "v$VERSION"
+              echo "$repo: tagged v$VERSION"
+            fi
+          done
