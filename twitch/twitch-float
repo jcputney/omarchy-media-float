@@ -1,0 +1,319 @@
+#!/usr/bin/env bash
+# twitch-float — browse Twitch and play a stream in the floating, pinned overlay
+# that follows you across every Hyprland workspace.
+#
+#   twitch-float auth            one-time device-code sign-in
+#   twitch-float browse          live follows, then categories / top / search
+#   twitch-float play <login>    play a specific channel
+#   twitch-float quality <q>     720p60 | best | toggle (restarts the stream)
+#
+# Hide/show, resize and close are shared with the other overlays: see
+# `float-overlay`.
+#
+# Config: ~/.config/twitch-float/config    TWITCH_CLIENT_ID=...
+# Tokens: ~/.config/twitch-float/tokens    (written by `auth`, mode 0600)
+
+set -euo pipefail
+
+SELF="$(readlink -f "$0")"
+APP_ID="TwitchFloat"
+OVERLAY_APP_NAME="Twitch"
+# The overlay picker is this tool's own Omarchy plugin. Absent or
+# disabled, the menus fall back to ghostty+fzf.
+: "${FLOAT_PICKER_PLUGIN_ID:=io.github.jcputney.media-float-twitch}"
+export FLOAT_PICKER_PLUGIN_ID
+# shellcheck source=/dev/null
+source "$HOME/.local/lib/float-overlay.sh"
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/twitch-float"
+CONFIG="$CONFIG_DIR/config"
+TOKENS="$CONFIG_DIR/tokens"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/twitch-float"
+MENU="$CACHE_DIR/menu.tsv"
+CHANNEL_FILE="$RUN_DIR/twitch-channel"
+QUALITY_FILE="$CONFIG_DIR/quality"
+
+SCOPES="user:read:follows"
+DEFAULT_QUALITY="720p60,720p,best"
+
+mkdir -p "$CONFIG_DIR" "$CACHE_DIR"
+
+load_config() {
+  [[ -f $CONFIG ]] || die "No config yet. Put TWITCH_CLIENT_ID=... in $CONFIG"
+  # shellcheck source=/dev/null
+  source "$CONFIG"
+  [[ -n ${TWITCH_CLIENT_ID:-} ]] || die "TWITCH_CLIENT_ID is not set in $CONFIG"
+}
+
+save_tokens() { # save_tokens <access> <refresh> <expires_in>
+  umask 077
+  cat > "$TOKENS" <<EOF
+TWITCH_ACCESS_TOKEN=$1
+TWITCH_REFRESH_TOKEN=$2
+TWITCH_TOKEN_EXPIRES=$(( $(date +%s) + $3 ))
+EOF
+}
+
+# ── Auth (device code flow) ─────────────────────────────────────────────────
+# Public client: no client secret anywhere, including on refresh.
+
+cmd_auth() {
+  load_config
+  local resp device_code user_code verify interval expires waited token err
+
+  resp="$(curl -fsS -X POST "https://id.twitch.tv/oauth2/device" \
+    --data-urlencode "client_id=$TWITCH_CLIENT_ID" \
+    --data-urlencode "scopes=$SCOPES")" \
+    || die "Could not start device authorization — is the Client ID right, and the app set to Public?"
+
+  device_code="$(jq -r '.device_code' <<< "$resp")"
+  user_code="$(jq -r '.user_code' <<< "$resp")"
+  verify="$(jq -r '.verification_uri' <<< "$resp")"
+  interval="$(jq -r '.interval // 5' <<< "$resp")"
+  expires="$(jq -r '.expires_in // 1800' <<< "$resp")"
+
+  printf '\n  Open:  %s\n  Code:  %s\n\n  Waiting for you to approve…\n\n' "$verify" "$user_code"
+  note "Enter code $user_code at $verify"
+  command -v xdg-open >/dev/null && setsid -f xdg-open "$verify" >/dev/null 2>&1 || true
+
+  waited=0
+  while (( waited < expires )); do
+    sleep "$interval"
+    waited=$(( waited + interval ))
+    resp="$(curl -sS -X POST "https://id.twitch.tv/oauth2/token" \
+      --data-urlencode "client_id=$TWITCH_CLIENT_ID" \
+      --data-urlencode "device_code=$device_code" \
+      --data-urlencode "grant_type=urn:ietf:params:oauth:grant-type:device_code" 2>/dev/null)" || continue
+    token="$(jq -r '.access_token // empty' <<< "$resp")"
+    if [[ -n $token ]]; then
+      save_tokens "$token" \
+        "$(jq -r '.refresh_token // empty' <<< "$resp")" \
+        "$(jq -r '.expires_in // 3600' <<< "$resp")"
+      printf '  Signed in. Tokens written to %s\n\n' "$TOKENS"
+      note "Signed in to Twitch"
+      return 0
+    fi
+    err="$(jq -r '.message // .error // empty' <<< "$resp")"
+    # authorization_pending is the normal "not approved yet" answer.
+    case "$err" in
+      *pending*|*"slow down"*|"") ;;
+      *) die "Sign-in failed: $err" ;;
+    esac
+  done
+  die "Sign-in timed out — run: twitch-float auth"
+}
+
+ensure_token() {
+  load_config
+  [[ -f $TOKENS ]] || die "Not signed in. Run: twitch-float auth"
+  # shellcheck source=/dev/null
+  source "$TOKENS"
+  [[ -n ${TWITCH_ACCESS_TOKEN:-} ]] || die "Not signed in. Run: twitch-float auth"
+
+  # Refresh a minute before expiry so a long browse never dies mid-request.
+  if (( $(date +%s) >= ${TWITCH_TOKEN_EXPIRES:-0} - 60 )); then
+    local resp token
+    resp="$(curl -sS -X POST "https://id.twitch.tv/oauth2/token" \
+      --data-urlencode "client_id=$TWITCH_CLIENT_ID" \
+      --data-urlencode "grant_type=refresh_token" \
+      --data-urlencode "refresh_token=${TWITCH_REFRESH_TOKEN:-}" 2>/dev/null)" || true
+    token="$(jq -r '.access_token // empty' <<< "${resp:-}")"
+    [[ -n $token ]] || die "Session expired. Run: twitch-float auth"
+    save_tokens "$token" \
+      "$(jq -r '.refresh_token // empty' <<< "$resp")" \
+      "$(jq -r '.expires_in // 3600' <<< "$resp")"
+    TWITCH_ACCESS_TOKEN="$token"
+  fi
+}
+
+helix() { # helix <path-with-query>
+  curl -fsS --max-time 20 \
+    -H "Client-Id: $TWITCH_CLIENT_ID" \
+    -H "Authorization: Bearer $TWITCH_ACCESS_TOKEN" \
+    "https://api.twitch.tv/helix$1"
+}
+
+user_id() {
+  local f="$CACHE_DIR/user_id"
+  if [[ -s $f ]]; then cat "$f"; return 0; fi
+  local id
+  id="$(helix /users | jq -r '.data[0].id // empty')"
+  [[ -n $id ]] || die "Could not read your Twitch account — try: twitch-float auth"
+  printf '%s\n' "$id" | tee "$f"
+}
+
+# ── Menus ──────────────────────────────────────────────────────────────────
+# Rows: <display> \t <thumbnail-url> \t <info> \t <action> \t <value>
+# The whole navigation runs inside one picker window; tui_* functions are the
+# parts that execute there.
+
+jq_stream_rows='
+  def viewers: if . >= 1000 then ((. / 100 | floor) / 10 | tostring) + "k" else tostring end;
+  def clean: (. // "") | gsub("[\t\n\r]"; " ");
+  .data[]?
+  | ((now - (.started_at | fromdateiso8601)) | floor) as $up
+  | [ "●  " + (.user_name // .user_login)
+        + "   —   " + (if (.game_name // "") == "" then "?" else .game_name end)
+        + "   ·  " + (.viewer_count // 0 | viewers),
+      (.thumbnail_url // "-" | sub("\\{width\\}"; "640") | sub("\\{height\\}"; "360")),
+      ((.user_name // .user_login)
+        + "\u001f" + (if (.game_name // "") == "" then "?" else .game_name end)
+        + "\u001f" + (.viewer_count // 0 | tostring) + " viewers  ·  live "
+        + ($up / 3600 | floor | tostring) + "h "
+        + (($up % 3600) / 60 | floor | tostring) + "m"
+        + "\u001f\u001f" + (.title | clean)),
+      "play",
+      .user_login ]
+  | @tsv'
+
+live_follows() { helix "/streams/followed?user_id=$(user_id)&first=100" | jq -r "$jq_stream_rows"; }
+
+nav_row() { printf '%s\t-\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4"; }
+
+tui_main_rows() {
+  live_follows
+  nav_row "🔍  Search channels…"             "Search Twitch for a channel by name." menu search
+  nav_row "📂  Browse categories…"           "Pick a game or category, then a stream." menu categories
+  nav_row "🔥  Top streams right now"        "The biggest live streams on Twitch." menu top
+  nav_row "👥  All followed (incl. offline)" "Every channel you follow, live or not." menu follows
+}
+
+tui_submenu() { # tui_submenu <which>
+  case "$1" in
+    search)
+      local q; q="$(ask "Search Twitch…")"
+      [[ -n $q ]] || return 1
+      helix "/search/channels?live_only=true&first=50&query=$(printf %s "$q" | jq -sRr @uri)" \
+        | jq -r '
+            def clean: (. // "") | gsub("[\t\n\r]"; " ");
+            .data[]?
+            | [ "●  " + (.display_name // .broadcaster_login)
+                  + "   —   " + (if (.game_name // "") == "" then "?" else .game_name end),
+                (.thumbnail_url // "-"),
+                ((.display_name // .broadcaster_login) + "\u001f"
+                  + (if (.game_name // "") == "" then "?" else .game_name end)
+                  + "\u001f\u001f" + (.title | clean)),
+                "play", .broadcaster_login ] | @tsv' > "$MENU"
+      ;;
+    categories)
+      helix "/games/top?first=100" | jq -r '
+        .data[]? | [ "📂  " + .name,
+                     (.box_art_url // "-" | sub("\\{width\\}"; "285") | sub("\\{height\\}"; "380")),
+                     .name, "game", .id ] | @tsv' > "$MENU"
+      ;;
+    top)     helix "/streams?first=100" | jq -r "$jq_stream_rows" > "$MENU" ;;
+    follows)
+      helix "/channels/followed?user_id=$(user_id)&first=100" \
+        | jq -r '.data[]? | [ "   " + .broadcaster_name, "-",
+                              (.broadcaster_name + "\u001f\u001fFollowed channel. Offline channels cannot be played."),
+                              "play", .broadcaster_login ] | @tsv' > "$MENU"
+      ;;
+  esac
+  [[ -s $MENU ]] || return 1
+  tui_route "$(pick "$MENU" "Twitch")"
+}
+
+tui_route() { # tui_route "<action>\t<value>"
+  local action value
+  [[ -n ${1:-} ]] || return 1
+  IFS=$'\t' read -r action value <<< "$1"
+  case "$action" in
+    play) emit "$value" ;;
+    menu) tui_submenu "$value" ;;
+    game)
+      helix "/streams?game_id=$value&first=100" | jq -r "$jq_stream_rows" > "$MENU"
+      [[ -s $MENU ]] || return 1
+      tui_route "$(pick "$MENU" "Twitch")"
+      ;;
+  esac
+}
+
+cmd_browse_tui() {
+  ensure_token
+  tui_main_rows > "$MENU"
+  tui_route "$(pick "$MENU" "Twitch")" || true
+}
+
+cmd_browse() {
+  local login
+  login="$(run_menu "$SELF _browse_tui")"
+  [[ -n $login ]] || exit 0
+  ensure_token
+  start_stream "$login"
+}
+
+# ── Playback ────────────────────────────────────────────────────────────────
+
+quality() { cat "$QUALITY_FILE" 2>/dev/null || echo "$DEFAULT_QUALITY"; }
+
+start_stream() { # start_stream <login>
+  [[ -n ${1:-} ]] || exit 0
+  # Offline channels are reachable from the "All followed" list, and streamlink
+  # simply finds no streams and exits, leaving no window and no explanation.
+  # Ask Helix first so there is something to say.
+  [[ -n "$(helix "/streams?user_login=$1" | jq -r '.data[0].id // empty')" ]] \
+    || die "$1 is not live right now"
+  stop_existing
+  printf '%s\n' "$1" > "$CHANNEL_FILE"
+  setsid -f "$0" _session "$1" >> "$LOG" 2>&1
+  note "Opening $1…"
+}
+
+cmd_session() { # cmd_session <login>
+  local login="$1" mpv_pid
+  echo "$$" > "$PID_FILE"
+  # setsid gives this session its own process group, so killing the group on the
+  # way out takes streamlink with it.
+  trap 'trap - EXIT; rm -f "$PID_FILE"; kill -- "-$$" 2>/dev/null || true' EXIT
+
+  overlay_mpv_args "$APP_ID" "$login on Twitch"
+  rm -f "$SOCKET"
+
+  # streamlink handles the Twitch HLS and drops ad segments; mpv just plays the
+  # bytes off the pipe. A live stream is not seekable, which is fine here.
+  local err="$RUN_DIR/streamlink.err" started
+  started="$(date +%s)"
+  streamlink --twitch-disable-ads --stdout \
+    "https://twitch.tv/$login" "$(quality)" 2>"$err" \
+    | mpv "${OVERLAY_MPV_ARGS[@]}" - >/dev/null 2>&1 &
+  mpv_pid=$!
+
+  overlay_apply_size_when_ready
+  wait "$mpv_pid" || true
+
+  # Dying within a few seconds means it never really started; surface why.
+  if (( $(date +%s) - started < 10 )); then
+    note "$(grep -m1 -i "error" "$err" 2>/dev/null || echo "$login stopped unexpectedly")"
+  fi
+}
+
+cmd_quality() {
+  ensure_token
+  local want="${1:-toggle}" cur
+  cur="$(quality)"
+  case "$want" in
+    toggle) if [[ $cur == best ]]; then want="$DEFAULT_QUALITY"; else want=best; fi ;;
+    source) want=best ;;
+  esac
+  printf '%s\n' "$want" > "$QUALITY_FILE"
+  note "Quality: $want"
+  # Restart the current channel so the change takes effect now — but only if the
+  # overlay on screen is actually a Twitch stream, not a Plex one.
+  if [[ -s $CHANNEL_FILE && "$(overlay_field .class)" == "$APP_ID" ]]; then
+    start_stream "$(cat "$CHANNEL_FILE")"
+  fi
+}
+
+case "${1:-browse}" in
+  auth)     cmd_auth ;;
+  browse)   cmd_browse ;;
+  _browse_tui) cmd_browse_tui ;;
+  _preview) shift || true; render_preview "${1:--}" "${2:--}" ;;
+  play)     shift; ensure_token; start_stream "${1:?channel login required}" ;;
+  quality)  shift || true; cmd_quality "${1:-toggle}" ;;
+  toggle)   cmd_toggle ;;
+  quit)     cmd_quit ;;
+  size)     shift || true; cmd_size "${1:-cycle}" ;;
+  _session) shift; cmd_session "$1" ;;
+  *)        die "Unknown command: $1 (auth|browse|play|quality|toggle|quit|size)" ;;
+esac

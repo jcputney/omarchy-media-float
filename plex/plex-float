@@ -1,0 +1,497 @@
+#!/usr/bin/env bash
+# plex-float — search a Plex server and play the result in the floating, pinned
+# overlay that follows you across every Hyprland workspace.
+#
+#   plex-float auth          sign in to Plex (browser approval, no token to copy)
+#   plex-float server [name]        list your servers, or switch to one
+#   plex-float server --url <url>   point at a server address by hand
+#   plex-float server --list        show every server address that answers
+#   plex-float search        pick something and start playing
+#   plex-float index         rebuild the cached library list
+#
+# Hide/show, resize and close are shared with the other overlays: see
+# `float-overlay`. `auth` writes ~/.config/plex-float/tokens (mode 0600); a
+# hand-written ~/.config/plex-float/config with PLEX_URL and PLEX_TOKEN still
+# takes precedence if you have one.
+
+set -euo pipefail
+
+SELF="$(readlink -f "$0")"
+APP_ID="PlexFloat"
+OVERLAY_APP_NAME="Plex"
+# The overlay picker is this tool's own Omarchy plugin. Absent or
+# disabled, the menus fall back to ghostty+fzf.
+: "${FLOAT_PICKER_PLUGIN_ID:=io.github.jcputney.media-float-plex}"
+export FLOAT_PICKER_PLUGIN_ID
+# shellcheck source=/dev/null
+source "$HOME/.local/lib/float-overlay.sh"
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/plex-float"
+CONFIG="$CONFIG_DIR/config"
+TOKENS="$CONFIG_DIR/tokens"
+CLIENT_ID_FILE="$CONFIG_DIR/client-id"
+PLEX_PRODUCT="plex-float"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/plex-float"
+INDEX="$CACHE_DIR/index.tsv"
+EPISODES="$CACHE_DIR/episodes.tsv"
+
+# Rebuild the library index if it is older than this many seconds.
+INDEX_MAX_AGE=86400
+
+mkdir -p "$CONFIG_DIR" "$CACHE_DIR"
+
+load_config() {
+  # `auth` writes tokens; a hand-written config still wins, so an existing
+  # setup keeps working untouched.
+  # shellcheck source=/dev/null
+  [[ -f $TOKENS ]] && source "$TOKENS"
+  local discovered="${PLEX_URL:-}"
+  # Clear both names first: the config may set the PLEX_HOST alias, and leaving
+  # the discovered PLEX_URL in place would win the fallback chain below and
+  # silently override it.
+  PLEX_URL="" PLEX_HOST=""
+  # shellcheck source=/dev/null
+  [[ -f $CONFIG ]] && source "$CONFIG"
+  # PLEX_HOST is accepted as an alias for PLEX_URL.
+  PLEX_URL="${PLEX_URL:-${PLEX_HOST:-$discovered}}"
+  [[ -n ${PLEX_TOKEN:-} ]] || die "Not signed in to Plex yet — run: plex-float auth"
+  [[ -n $PLEX_URL ]] || die "No Plex server chosen yet — run: plex-float server"
+  # Accept a bare host, a host:port, or a full URL.
+  [[ $PLEX_URL == *://* ]] || PLEX_URL="http://$PLEX_URL"
+  [[ ${PLEX_URL#*://} == *:* ]] || PLEX_URL="$PLEX_URL:32400"
+  PLEX_URL="${PLEX_URL%/}"
+  # The cached index stores bare thumb paths so the token never lands on disk;
+  # the picker turns them into fetchable URLs at render time.
+  FLOAT_PICKER_IMAGE_PREFIX="$PLEX_URL"
+  FLOAT_PICKER_IMAGE_SUFFIX="?X-Plex-Token=$PLEX_TOKEN"
+  export FLOAT_PICKER_IMAGE_PREFIX FLOAT_PICKER_IMAGE_SUFFIX
+  CLIENT_ID="${PLEX_CLIENT_ID:-plex-float-$(hostnamectl --static 2>/dev/null || echo host)}"
+  AUTOPLAY_NEXT="${AUTOPLAY_NEXT:-1}"
+  # Fraction of the runtime you must reach for an episode to count as finished.
+  COMPLETE_AT="${COMPLETE_AT:-90}"
+}
+
+# ── plex.tv account (PIN device flow) ───────────────────────────────────────
+# No registered app and no client secret: plex.tv hands out a short code, the
+# user approves it in a browser, and polling the pin returns an auth token.
+
+client_id() {
+  if [[ ! -s $CLIENT_ID_FILE ]]; then
+    # The token plex.tv issues is bound to the identifier that asked for it, so
+    # this has to be stable across runs.
+    umask 077
+    printf 'plex-float-%s\n' \
+      "$(od -An -tx1 -N16 /dev/urandom | tr -d ' \n')" > "$CLIENT_ID_FILE"
+  fi
+  cat "$CLIENT_ID_FILE"
+}
+
+plextv() { # plextv <method> <path> [extra curl args…]
+  local method="$1" path="$2"; shift 2
+  curl -fsS --max-time 20 -X "$method" "https://plex.tv$path" \
+    -H "Accept: application/json" \
+    -H "X-Plex-Client-Identifier: $(client_id)" \
+    -H "X-Plex-Product: $PLEX_PRODUCT" \
+    -H "X-Plex-Version: 1.0" \
+    -H "X-Plex-Device: Linux" \
+    -H "X-Plex-Platform: Hyprland" \
+    -H "X-Plex-Device-Name: plex-float on ${HOSTNAME:-linux}" \
+    "$@"
+}
+
+save_token() { umask 077; printf 'PLEX_TOKEN=%s\n' "$1" > "$TOKENS"; }
+
+save_server() { # save_server <url> [server-name]
+  local tok=""
+  # A bare assignment from a failing pipeline would take the whole script down
+  # under `set -e`, and on a first sign-in there is no tokens file yet.
+  [[ -f $TOKENS ]] && tok="$(sed -n 's/^PLEX_TOKEN=//p' "$TOKENS" | head -1)"
+  tok="${tok:-${PLEX_TOKEN:-}}"
+  umask 077
+  # The name is kept so the address can be re-resolved later, after a DHCP
+  # lease or a remote-access change moves it.
+  printf 'PLEX_TOKEN=%s\nPLEX_URL=%s\nPLEX_SERVER_NAME=%s\n' "$tok" "$1" "${2:-}" > "$TOKENS"
+}
+
+cmd_auth() {
+  local pin id code url token waited=0
+  pin="$(plextv POST "/api/v2/pins?strong=true")" || die "Could not reach plex.tv"
+  id="$(jq -r '.id' <<< "$pin")"
+  code="$(jq -r '.code' <<< "$pin")"
+  [[ -n $id && $id != null ]] || die "plex.tv did not return a sign-in code"
+
+  url="https://app.plex.tv/auth#?clientID=$(client_id)&code=$code"
+  url+="&context%5Bdevice%5D%5Bproduct%5D=$PLEX_PRODUCT"
+  note "Approve plex-float in your browser"
+  printf 'Opening the Plex sign-in page. If nothing opens, visit:\n\n  %s\n\n' "$url"
+  xdg-open "$url" >/dev/null 2>&1 &
+
+  printf 'Waiting for approval'
+  while (( waited < 300 )); do
+    sleep 2; waited=$(( waited + 2 )); printf '.'
+    token="$(plextv GET "/api/v2/pins/$id" 2>/dev/null | jq -r '.authToken // empty')"
+    [[ -n $token ]] && break
+  done
+  printf '\n'
+  [[ -n $token ]] || die "Timed out waiting for approval. Run 'plex-float auth' to try again."
+
+  save_token "$token"
+  PLEX_TOKEN="$token"
+  note "Signed in to Plex"
+  cmd_server
+}
+
+# Every connection of every server the account can reach — owned and shared —
+# best first: a direct local address beats a direct remote one, and anything
+# beats a plex.tv relay, which is proxied and bandwidth-capped. All of them are
+# listed rather than just the best, because plex.tv reports docker and VPN
+# addresses as "local" and those are often unreachable from here.
+list_servers() {
+  plextv GET "/api/v2/resources?includeHttps=1&includeRelay=1" \
+    -H "X-Plex-Token: ${PLEX_TOKEN:?}" \
+    | jq -r '
+        .[] | select((.provides // "") | test("server"))
+        | . as $s
+        | [ .connections[]? | select(.uri != null) ]
+        | sort_by([ (if .relay then 1 else 0 end), (if .local then 0 else 1 end) ])
+        | .[]
+        | [ ($s.name // "Plex"),
+            (if ($s.owned // false) then "yours" else "shared" end),
+            (if .relay then "relay" elif .local then "local" else "remote" end),
+            .uri ] | @tsv'
+}
+
+# Probing is the slow part, so every address is tried at once. Results go to
+# files named by input position and are read back in that order, which keeps
+# the ranking above intact instead of letting the fastest reply win.
+reachable_servers() { # reachable_servers <rows-file>
+  local tmp i=0 row f
+  tmp="$(mktemp -d)"
+  while IFS= read -r row; do
+    [[ -n $row ]] || continue
+    i=$(( i + 1 ))
+    (
+      local uri="${row##*$'\t'}"
+      curl -fsS --max-time 5 -o /dev/null \
+        -H "X-Plex-Token: $PLEX_TOKEN" "$uri/identity" 2>/dev/null \
+        && printf '%s\n' "$row" > "$tmp/$(printf '%04d' "$i")"
+    ) &
+  done < "$1"
+  wait
+  for f in "$tmp"/*; do [[ -f $f ]] && cat "$f"; done
+  rm -rf "$tmp"
+}
+
+server_label() { # server_label <name> <yours|shared> <local|remote|relay>
+  printf '%s   ·  %s  ·  %s' "$1" "$2" "$3"
+}
+
+cmd_server() { # cmd_server [name|--url <url>|--list]
+  if [[ -z ${PLEX_TOKEN:-} ]]; then
+    # shellcheck source=/dev/null
+    [[ -f $TOKENS ]] && source "$TOKENS"
+    # shellcheck source=/dev/null
+    [[ -f $CONFIG ]] && source "$CONFIG"
+  fi
+  [[ -n ${PLEX_TOKEN:-} ]] || die "Not signed in to Plex yet — run: plex-float auth"
+
+  # plex.tv only advertises the addresses a server reports about itself, which
+  # on a docker or VPN setup can miss the LAN address entirely. --url sets one
+  # by hand and skips discovery.
+  if [[ ${1:-} == "--url" ]]; then
+    [[ -n ${2:-} ]] || die "Usage: plex-float server --url http://host:32400"
+    save_server "${2%/}" ""
+    note "Plex server set to ${2%/}"
+    printf 'Server set to %s\n' "${2%/}"
+    return 0
+  fi
+
+  local all reach want="" list_only=0
+  case "${1:-}" in
+    --list) list_only=1 ;;
+    "")     ;;
+    *)      want="$1" ;;
+  esac
+
+  all="$(mktemp)"; list_servers > "$all" || die "Could not list your Plex servers"
+  [[ -s $all ]] || { rm -f "$all"; die "Your Plex account has no servers on it"; }
+  [[ -n $want ]] && { grep -P "^\Q$want\E\t" "$all" > "$all.f" 2>/dev/null || true
+                      mv "$all.f" "$all"
+                      [[ -s $all ]] || { rm -f "$all"; die "No server named '$want' on your account"; } }
+
+  reach="$(reachable_servers "$all")"
+  rm -f "$all"
+  [[ -n $reach ]] || die "None of your Plex servers answered. If you are away from home, enable Remote Access on the server."
+
+  if (( list_only )); then
+    printf '%s\n' "$reach" | awk -F'\t' '{printf "  %-24s %-7s %-7s %s\n", $1, $2, $3, $4}'
+    return 0
+  fi
+
+  local name owner kind uri picked
+  # One reachable address, or a name was given: nothing to choose between.
+  if [[ -n $want ]] || [[ "$(printf '%s\n' "$reach" | wc -l)" -eq 1 ]]; then
+    picked="$(printf '%s\n' "$reach" | head -1)"
+  elif [[ -t 0 && -t 1 ]] && command -v fzf >/dev/null; then
+    picked="$(printf '%s\n' "$reach" \
+      | awk -F'\t' '{printf "%s   ·  %s  ·  %s\t%s\n", $1, $2, $3, $0}' \
+      | fzf --delimiter=$'\t' --with-nth=1 --prompt="Plex server " \
+            --height=40% --layout=reverse --no-multi \
+      | cut -f2-)" || true
+    [[ -n $picked ]] || { note "Kept the current Plex server"; return 0; }
+  else
+    picked="$(printf '%s\n' "$reach" | head -1)"
+  fi
+
+  IFS=$'\t' read -r name owner kind uri <<< "$picked"
+  save_server "$uri" "$name"
+  note "Plex server: $name ($kind)"
+  printf 'Server set to %s — %s, %s\n  %s\n' "$name" "$owner" "$kind" "$uri"
+  printf '\nOther addresses that answered:\n'
+  printf '%s\n' "$reach" | awk -F'\t' -v u="$uri" '$4 != u {printf "  %-24s %-7s %-7s %s\n", $1, $2, $3, $4}'
+  printf '\nChange it with: plex-float server "<name>"   (or --url, or --list)\n'
+}
+
+api() {
+  curl -fsS --max-time 25 \
+    -H "Accept: application/json" \
+    -H "X-Plex-Token: $PLEX_TOKEN" \
+    -H "X-Plex-Client-Identifier: $CLIENT_ID" \
+    -H "X-Plex-Product: plex-float" \
+    -H "X-Plex-Version: 1.0" \
+    -H "X-Plex-Device: Linux" \
+    -H "X-Plex-Platform: Hyprland" \
+    "$PLEX_URL$1"
+}
+
+# ── Library index ───────────────────────────────────────────────────────────
+# One row per movie or show, in the shared picker's format:
+#   <display>\t<poster-path>\t<info>\t<ratingKey>\t<type>
+# The poster is stored as a bare Plex path. The token is added in `_preview`
+# instead, so it never lands in the cache file.
+
+# jq helpers shared by the index and the episode list.
+JQ_DEFS='
+  def clean: (. // "") | gsub("[\t\n\r]"; " ");
+  def hms: ((. // 0) / 60000 | floor)
+           | if . >= 60 then ((. / 60 | floor)|tostring) + "h " + ((. % 60)|tostring) + "m"
+             else (tostring) + "m" end;
+  def pad2: tostring | if length < 2 then "0" + . else . end;
+'
+
+build_index() {
+  local tmp sections key type lib
+  tmp="$(mktemp)"
+  sections="$(api /library/sections \
+    | jq -r '.MediaContainer.Directory[]?
+             | select(.type=="movie" or .type=="show")
+             | [.key, .type, .title] | @tsv')" \
+    || die "Could not reach $PLEX_URL — check PLEX_URL and PLEX_TOKEN"
+  [[ -n $sections ]] || die "No movie or TV libraries found on $PLEX_URL"
+
+  while IFS=$'\t' read -r key type lib; do
+    [[ -n $key ]] || continue
+    api "/library/sections/$key/all" | jq -r --arg lib "$lib" --arg type "$type" "$JQ_DEFS"'
+      .MediaContainer.Metadata[]?
+      | [ (if $type == "show" then "📺" else "🎬" end)
+          + "  " + .title
+          + (if .year then "  (" + (.year|tostring) + ")" else "" end)
+          + "    ·  " + $lib,
+          (.thumb // "-"),
+          ( .title
+            + (if .year then " (" + (.year|tostring) + ")" else "" end)
+            + "\u001f" + $lib
+            + (if $type == "show"
+               then (if .childCount then "  ·  " + (.childCount|tostring) + " seasons" else "" end)
+               else (if .duration then "  ·  " + (.duration|hms) else "" end) end)
+            + (if (.contentRating // "") != "" then "  ·  " + .contentRating else "" end)
+            + "\u001f\u001f" + (.summary | clean) ),
+          (.ratingKey|tostring),
+          $type ]
+      | @tsv' >> "$tmp"
+  done <<< "$sections"
+
+  [[ -s $tmp ]] || { rm -f "$tmp"; die "Plex returned an empty library"; }
+  mv "$tmp" "$INDEX"
+}
+
+index_is_stale() {
+  [[ ! -s $INDEX ]] && return 0
+  local age=$(( $(date +%s) - $(stat -c %Y "$INDEX") ))
+  (( age > INDEX_MAX_AGE ))
+}
+
+pick_episode() { # pick_episode <showRatingKey>; echoes "<ratingKey>\t<type>"
+  api "/library/metadata/$1/allLeaves" | jq -r "$JQ_DEFS"'
+    def info:
+      "S" + ((.parentIndex // 0)|pad2) + "E" + ((.index // 0)|pad2) + "  " + .title
+      + "\u001f" + (.grandparentTitle // "")
+      + (if .duration then "  ·  " + (.duration|hms) else "" end)
+      + (if (.viewOffset // 0) > 0 then "  ·  resume at " + (.viewOffset|hms)
+         elif (.viewCount // 0) > 0 then "  ·  watched"
+         else "" end)
+      + "\u001f\u001f" + (.summary | clean);
+    def row($label): [ $label, (.thumb // "-"), info, (.ratingKey|tostring), "episode" ] | @tsv;
+    [ .MediaContainer.Metadata[]? ] as $eps
+    | ( ( [ $eps[] | select((.viewOffset // 0) > 0) ][0] )
+        // ( [ $eps[] | select((.viewCount // 0) == 0) ][0] )
+        // $eps[0] ) as $next
+    | ( if $next then
+          $next | row("▶  Next up:  S" + ((.parentIndex // 0)|pad2)
+                       + "E" + ((.index // 0)|pad2) + "  " + .title)
+        else empty end ),
+      ( $eps[]
+        | row("S" + ((.parentIndex // 0)|pad2) + "E" + ((.index // 0)|pad2) + "  " + .title
+              + (if (.viewOffset // 0) > 0 then "    ⏸ resume"
+                 elif (.viewCount // 0) > 0 then "    ✓"
+                 else "" end)) )
+  ' > "$EPISODES"
+  [[ -s $EPISODES ]] || die "That show has no episodes"
+  pick "$EPISODES" "Episode"
+}
+
+# ── Playback ────────────────────────────────────────────────────────────────
+
+timeline() { # timeline <ratingKey> <state> <time-ms> <duration-ms>
+  api "/:/timeline?ratingKey=$1&key=/library/metadata/$1&identifier=com.plexapp.plugins.library&state=$2&time=$3&duration=$4" \
+    >/dev/null 2>&1 || true
+}
+
+scrobble_loop() { # scrobble_loop <ratingKey> <duration-ms> <mpv-pid>
+  local rk="$1" dur="$2" pid="$3" pos paused state
+  while kill -0 "$pid" 2>/dev/null; do
+    sleep 5
+    pos="$(mpv_get time-pos)" || continue
+    [[ -n $pos && $pos != null ]] || continue
+    pos="${pos%.*}"
+    printf '%s\n' "$pos" > "$POS_FILE"
+    paused="$(mpv_get pause)"
+    state="playing"; [[ $paused == "true" ]] && state="paused"
+    timeline "$rk" "$state" "$(( pos * 1000 ))" "$dur"
+  done
+}
+
+play_one() { # play_one <ratingKey>; returns 0 if it played to the end
+  local rk="$1" meta part dur offset title mpv_pid scrobble_pid pos
+  meta="$(api "/library/metadata/$rk")" || die "Could not load metadata for $rk"
+
+  part="$(jq -r '.MediaContainer.Metadata[0].Media[0].Part[0].key // empty' <<< "$meta")"
+  [[ -n $part ]] || die "No playable file on that item"
+  dur="$(jq -r '.MediaContainer.Metadata[0].duration // 0' <<< "$meta")"
+  offset="$(jq -r '.MediaContainer.Metadata[0].viewOffset // 0' <<< "$meta")"
+  title="$(jq -r '.MediaContainer.Metadata[0]
+                  | (if .grandparentTitle then .grandparentTitle + " — " else "" end)
+                    + (if .parentIndex and .index
+                       then "S" + (.parentIndex|tostring) + "E" + (.index|tostring) + "  "
+                       else "" end)
+                    + .title' <<< "$meta")"
+
+  overlay_mpv_args "$APP_ID" "$title"
+  # Resume, but only if you are properly into it and not already at the end.
+  if (( offset > 30000 && dur > 0 && offset < dur - 60000 )); then
+    OVERLAY_MPV_ARGS+=(--start="$(( offset / 1000 ))")
+  fi
+
+  rm -f "$SOCKET"
+  echo 0 > "$POS_FILE"
+
+  mpv "${OVERLAY_MPV_ARGS[@]}" "$PLEX_URL$part?X-Plex-Token=$PLEX_TOKEN" >/dev/null 2>&1 &
+  mpv_pid=$!
+
+  scrobble_loop "$rk" "$dur" "$mpv_pid" &
+  scrobble_pid=$!
+
+  overlay_apply_size_when_ready
+
+  wait "$mpv_pid" || true
+  kill "$scrobble_pid" 2>/dev/null || true
+
+  pos="$(cat "$POS_FILE" 2>/dev/null || echo 0)"
+  timeline "$rk" "stopped" "$(( pos * 1000 ))" "$dur"
+
+  # Finished, rather than closed early?
+  (( dur > 0 )) && (( pos * 1000 * 100 >= dur * COMPLETE_AT ))
+}
+
+next_episode() { # next_episode <ratingKey>; echoes the following episode's key
+  local meta show
+  meta="$(api "/library/metadata/$1")" || return 1
+  [[ "$(jq -r '.MediaContainer.Metadata[0].type' <<< "$meta")" == "episode" ]] || return 1
+  show="$(jq -r '.MediaContainer.Metadata[0].grandparentRatingKey // empty' <<< "$meta")"
+  [[ -n $show ]] || return 1
+  api "/library/metadata/$show/allLeaves" | jq -r --arg cur "$1" '
+    [ .MediaContainer.Metadata[]? | (.ratingKey|tostring) ] as $keys
+    | ($keys | index($cur)) as $i
+    | if $i != null and $keys[$i + 1] then $keys[$i + 1] else empty end'
+}
+
+cmd_session() { # runs detached: plays <ratingKey>, then rolls into the next
+  local rk="$1"
+  echo "$$" > "$PID_FILE"
+  trap 'rm -f "$PID_FILE"' EXIT
+  while [[ -n $rk ]]; do
+    if play_one "$rk"; then
+      [[ -f $STOP_FLAG ]] && break
+      (( AUTOPLAY_NEXT )) || break
+      rk="$(next_episode "$rk" || true)"
+    else
+      break
+    fi
+  done
+}
+
+search_tui() { # runs inside the picker window
+  load_config
+  local picked rk type
+  picked="$(pick "$INDEX" "Plex")" || return 1
+  IFS=$'\t' read -r rk type <<< "$picked"
+  [[ ${rk:-} =~ ^[0-9]+$ ]] || return 1
+
+  if [[ $type == "show" ]]; then
+    picked="$(pick_episode "$rk")" || return 1
+    IFS=$'\t' read -r rk type <<< "$picked"
+    [[ ${rk:-} =~ ^[0-9]+$ ]] || return 1
+  fi
+  emit "$rk"
+}
+
+cmd_search() {
+  load_config
+  # Index before the panel opens: it can take a while on a big library, and the
+  # picker should come up ready to type into.
+  if index_is_stale; then
+    note "Indexing your Plex library…"
+    build_index
+  fi
+
+  local rk
+  rk="$(run_menu "$SELF _search_tui")"
+  [[ ${rk:-} =~ ^[0-9]+$ ]] || exit 0
+
+  stop_existing
+  setsid -f "$0" _session "$rk" >> "$LOG" 2>&1
+}
+
+cmd_index() { load_config; note "Reindexing your Plex library…"; build_index; note "Indexed $(wc -l < "$INDEX") items"; }
+
+case "${1:-search}" in
+  search)   cmd_search ;;
+  auth)     cmd_auth ;;
+  server)   shift || true; cmd_server "$@" ;;
+  index)    cmd_index ;;
+  _search_tui) search_tui ;;
+  _preview)
+    shift || true
+    load_config
+    thumb="${1:--}"
+    # Plex needs the token on the poster request, but the cached index must not
+    # carry it, so it is attached here at render time.
+    [[ $thumb == /* ]] && thumb="$PLEX_URL$thumb?X-Plex-Token=$PLEX_TOKEN"
+    render_preview "$thumb" "${2:--}"
+    ;;
+  toggle)   cmd_toggle ;;
+  quit)     cmd_quit ;;
+  size)     shift || true; cmd_size "${1:-cycle}" ;;
+  _session) load_config; shift; cmd_session "$1" ;;
+  *)        die "Unknown command: $1 (auth|server|search|index|toggle|quit|size)" ;;
+esac

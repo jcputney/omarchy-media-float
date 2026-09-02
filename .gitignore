@@ -1,0 +1,3 @@
+# Built plugin repos. Each one is its own git checkout with its own remote;
+# `tools/publish` rewrites the files in place and keeps the .git it finds.
+dist/

@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.jcputney.media-float-plex",
+  "name": "Plex Float",
+  "version": "0.1.0",
+  "author": "jcputney",
+  "license": "MIT",
+  "description": "Search your Plex library in a native overlay with poster art, and play the pick in a floating, pinned mpv window that follows you across every workspace.",
+  "kinds": ["overlay"],
+  "entryPoints": {
+    "overlay": "Picker.qml"
+  }
+}

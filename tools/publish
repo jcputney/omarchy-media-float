@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# Builds the three distributable plugin repos out of this one.
+#
+#   tools/publish            build every tool into dist/
+#   tools/publish plex       build one
+#
+# Omarchy installs a plugin with a plain `git clone` and updates it with
+# `fetch` + `merge --ff-only`. Neither runs `submodule update`, so a submodule
+# would arrive as an empty directory and the shared code would simply be
+# missing. It is copied in here instead: one source of truth in this repo, three
+# self-contained checkouts for users.
+
+set -euo pipefail
+
+ROOT="$(cd -- "$(dirname -- "$(readlink -f "$0")")/.." && pwd)"
+DIST="$ROOT/dist"
+
+fail() { printf 'publish: %s\n' "$*" >&2; exit 1; }
+
+build() { # build <slug>
+  local slug="$1" src="$ROOT/$slug" out="$DIST/omarchy-media-float-$1"
+  [[ -d $src ]] || fail "no such tool: $slug"
+  [[ -f $src/manifest.json ]] || fail "$slug has no manifest.json"
+
+  # Clear the tree but keep .git: once a dist folder has been pushed it is the
+  # working copy of the published repo, and a rebuild is a new commit on it, not
+  # a new repository.
+  mkdir -p "$out"
+  find "$out" -mindepth 1 -maxdepth 1 -name .git -prune -o -exec rm -rf {} +
+  mkdir -p "$out/bin" "$out/lib" "$out/hypr"
+
+  # Plugin half: the manifest and the QML the shell loads.
+  cp "$src/manifest.json" "$out/manifest.json"
+  cp "$ROOT/core/Picker.qml" "$out/Picker.qml"
+
+  # Command half: installed by setup, not by the shell.
+  cp "$src/$slug-float" "$out/bin/$slug-float"
+  cp "$ROOT/core/float-overlay" "$out/bin/float-overlay"
+  cp "$ROOT/core/float-overlay.sh" "$out/lib/float-overlay.sh"
+  cp "$ROOT/core/hypr/media-float.lua" "$out/hypr/media-float.lua"
+  cp "$ROOT/core/setup" "$out/setup"
+  cp "$ROOT/LICENSE" "$out/LICENSE"
+  cp "$src/README.md" "$out/README.md"
+
+  chmod 755 "$out/setup" "$out/bin/"* "$out/lib/"*
+  chmod 644 "$out/manifest.json" "$out/Picker.qml" "$out/hypr/media-float.lua" \
+            "$out/LICENSE" "$out/README.md"
+
+  # The same check `omarchy plugin add` runs before it will install anything.
+  if command -v omarchy-plugin-validate >/dev/null 2>&1; then
+    omarchy-plugin-validate "$out" || fail "$slug failed plugin validation"
+  fi
+  bash -n "$out/setup" || fail "$slug setup has a syntax error"
+  bash -n "$out/bin/$slug-float" || fail "$slug-float has a syntax error"
+
+  printf '%s\n' "built $out"
+}
+
+if (( $# )); then
+  for slug in "$@"; do build "$slug"; done
+else
+  for slug in plex twitch youtube; do build "$slug"; done
+fi
