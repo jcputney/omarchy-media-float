@@ -141,17 +141,21 @@ install_cmds() {
 }
 
 remove_cmds() {
-  local f
+  local f target
   for f in "$HERE"/bin/*; do
     [[ -f $f ]] || continue
-    rm -f "$BIN_DIR/${f##*/}" && say "removed $BIN_DIR/${f##*/}"
+    target="$BIN_DIR/${f##*/}"
+    [[ -e $target ]] || continue
+    rm -f "$target" && say "removed $target"
   done
   if [[ $(installed_siblings) -gt 0 ]]; then
     say "kept $LIB_DIR/float-overlay.sh — another media-float tool still uses it"
   else
     for f in "$HERE"/lib/*; do
       [[ -f $f ]] || continue
-      rm -f "$LIB_DIR/${f##*/}" && say "removed $LIB_DIR/${f##*/}"
+      target="$LIB_DIR/${f##*/}"
+      [[ -e $target ]] || continue
+      rm -f "$target" && say "removed $target"
     done
     remove_hypr
   fi
