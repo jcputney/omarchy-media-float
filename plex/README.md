@@ -7,6 +7,8 @@ everything and follows you from workspace to workspace. Made for
 The picker shows poster art, the year, the runtime and the synopsis while you
 type. Pick a show and it asks which episode.
 
+![The picker](preview.png)
+
 ## Install
 
 ```bash

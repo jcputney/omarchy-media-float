@@ -7,6 +7,8 @@ and follows you from workspace to workspace. Made for
 Your live follows come first, with viewer counts and thumbnails, then
 categories, top channels, and search.
 
+![The picker](preview.png)
+
 ## Install
 
 ```bash
