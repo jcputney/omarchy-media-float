@@ -106,11 +106,12 @@ That directory holds your Twitch tokens.
 
 ## Requirements
 
-`mpv`, `streamlink`, `jq`, `curl`, `hyprctl`, `socat`.
+`mpv`, `streamlink`, `jq`, `curl`, `hyprctl`, `socat`, `xdg-utils`.
 
 `fzf`, `chafa` and `ghostty` are optional. They are the fallback menu, used when
 the shell plugin is disabled or you are not on Omarchy — the whole tool works
 without the plugin, just in a terminal window instead of a native overlay.
+`notify-send` is optional too; without it errors go to the terminal only.
 
 ## Related
 
