@@ -11,5 +11,7 @@
   ],
   "entryPoints": {
     "overlay": "Picker.qml"
-  }
+  },
+  "homepage": "https://github.com/jcputney/omarchy-media-float-twitch",
+  "repository": "https://github.com/jcputney/omarchy-media-float-twitch"
 }
