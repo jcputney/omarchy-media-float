@@ -38,11 +38,18 @@ DEFAULT_QUALITY="720p60,720p,best"
 
 mkdir -p "$CONFIG_DIR" "$CACHE_DIR"
 
+# The client ID this tool is registered under. A Twitch client ID is a public
+# identifier -- it is sent to Twitch on every request a browser makes -- so it
+# ships here rather than making everyone register their own app. The app is
+# registered Public, so sign-in is the device flow and there is no client secret
+# anywhere in this tool. Override it in the config to use your own registration.
+DEFAULT_CLIENT_ID="b9wf8ty2oka25ics0gduepoq9kssch"
+
 load_config() {
-  [[ -f $CONFIG ]] || die "No config yet. Put TWITCH_CLIENT_ID=... in $CONFIG"
   # shellcheck source=/dev/null
-  source "$CONFIG"
-  [[ -n ${TWITCH_CLIENT_ID:-} ]] || die "TWITCH_CLIENT_ID is not set in $CONFIG"
+  [[ -f $CONFIG ]] && source "$CONFIG"
+  TWITCH_CLIENT_ID="${TWITCH_CLIENT_ID:-$DEFAULT_CLIENT_ID}"
+  [[ -n $TWITCH_CLIENT_ID ]] || die "TWITCH_CLIENT_ID is empty; set it in $CONFIG"
 }
 
 save_tokens() { # save_tokens <access> <refresh> <expires_in>
