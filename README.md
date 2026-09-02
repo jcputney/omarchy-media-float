@@ -13,6 +13,25 @@ workspaces.
 They install and work separately. Installed together they share one player
 window, one set of overlay controls and one Hyprland rules file.
 
+## Install
+
+Pick the one you want — nothing here depends on the others. Plex, for example:
+
+```bash
+omarchy plugin add https://github.com/jcputney/omarchy-media-float-plex.git --enable
+~/.config/omarchy/plugins/io.github.jcputney.media-float-plex/setup
+omarchy restart shell
+```
+
+Swap `plex` for `twitch` or `youtube` in both lines. Each repo's README covers
+signing in and the keybindings to add.
+
+`omarchy plugin add` hands the shell the picker overlay; `setup` installs the
+command, the Hyprland window rules, and checks your dependencies. The restart is
+needed because the shell caches plugin QML once it has loaded it.
+
+This repo is the source. You do not install from it.
+
 ## Why three repos out of one
 
 `omarchy plugin add` is a plain `git clone`, and `omarchy plugin update` is
