@@ -115,7 +115,13 @@ jobs:
 
             # --delete so a file dropped from the source tree also leaves the
             # mirror. Without it, deletions never propagate.
-            rsync -a --delete --exclude .git "dist/$repo/" "$work/"
+            #
+            # --checksum because rsync's default quick check is size+mtime, and
+            # a version bump ("0.1.1" -> "0.1.2") changes neither: same length,
+            # and the fresh clone and the fresh build share an mtime second.
+            # That silently skipped manifest.json and shipped a release tagged
+            # 0.1.2 carrying a 0.1.1 manifest.
+            rsync -a --checksum --delete --exclude .git "dist/$repo/" "$work/"
 
             git -C "$work" add -A
             if git -C "$work" diff --cached --quiet; then
