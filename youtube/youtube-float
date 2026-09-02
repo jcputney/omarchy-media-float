@@ -414,7 +414,7 @@ EOF
     chmod 600 "$COOKIES"
     note "YouTube: signed in."
     printf 'Signed in. Subscriptions, Watch Later and history are available.\n'
-    printf 'Re-run `youtube-float auth` any time to refresh; the profile is kept,\n'
+    printf 'Renew later with `youtube-float auth --refresh`; the profile is kept,\n'
     printf 'so it will not ask you to sign in again unless the session expires.\n'
     return 0
   fi
@@ -426,10 +426,18 @@ EOF
   return 1
 }
 
-cmd_auth() { # cmd_auth [--manual]
+cmd_auth() { # cmd_auth [--manual|--refresh]
+  # --refresh forces the browser flow even when the current cookies still work,
+  # which is the only way to renew a session before it lapses.
+  if [[ ${1:-} == "--refresh" ]]; then
+    guided_auth && return 0
+    printf 'Refresh failed. Your existing cookies.txt is unchanged.\n'
+    return 1
+  fi
   if [[ ${1:-} != "--manual" && -s $COOKIES ]] && signed_in; then
     note "YouTube: signed in."
     printf 'Signed in. The personal feeds are available.\n'
+    printf 'To renew the session: youtube-float auth --refresh\n'
     return 0
   fi
   note "YouTube cookies are not signed in."
@@ -471,5 +479,5 @@ case "${1:-browse}" in
   quit)        cmd_quit ;;
   size)        shift || true; cmd_size "${1:-cycle}" ;;
   _session)    shift; cmd_session "$1" "${2:-YouTube}" ;;
-  *)           die "Unknown command: $1 (browse|play|quality|auth|toggle|quit|size)" ;;
+  *)           die "Unknown command: $1 (browse|play|quality|auth [--refresh|--manual]|toggle|quit|size)" ;;
 esac
