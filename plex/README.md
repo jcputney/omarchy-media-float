@@ -76,6 +76,30 @@ While something is playing: `SUPER` + right-drag resizes the window freehand,
 `SUPER + ALT + O` cycles it through four preset sizes, and the screen will not
 blank or lock.
 
+## Remove it
+
+Two commands, mirroring the install:
+
+```bash
+~/.config/omarchy/plugins/io.github.jcputney.media-float-plex/setup --uninstall
+omarchy plugin remove io.github.jcputney.media-float-plex
+```
+
+`setup --uninstall` removes the `plex-float` command, the shared `float-overlay`
+command and library, `~/.config/hypr/media-float.lua`, and the marked block it
+added to `hyprland.lua`. It leaves the shared pieces alone if another
+media-float tool is still installed, and it never touches keybindings you added
+yourself.
+
+Your settings are deliberately left behind, so reinstalling does not make you
+sign in again. Delete them yourself if you want them gone:
+
+```bash
+rm -rf ~/.config/plex-float
+```
+
+That directory holds your Plex token and server choice.
+
 ## Requirements
 
 `mpv`, `jq`, `curl`, `hyprctl`, `socat`.
