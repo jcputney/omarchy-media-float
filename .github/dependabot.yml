@@ -1,0 +1,20 @@
+# Only GitHub Actions is covered here, and that is not an oversight: this repo
+# is bash, Lua and QML, with no package manifest for Dependabot to read. The
+# three published plugin repos are mirrors with no workflows of their own, so
+# there is nothing there to update either — a dependabot.yml in them would only
+# ever be overwritten by the next release.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: ci
+    labels:
+      - dependencies
+    groups:
+      # One PR for all of them. There are few enough actions here that separate
+      # PRs would be noise.
+      actions:
+        patterns: ["*"]
