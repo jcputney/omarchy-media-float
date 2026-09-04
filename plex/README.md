@@ -61,6 +61,15 @@ plex-float index     # rebuild the library cache by hand
 The library is cached, so the picker opens instantly on a big library. It
 reindexes itself when the cache goes stale.
 
+Picking a TV show opens its seasons, with the episode you are part-way through
+(or the first you have not seen) pinned at the top as **Next up**. Each season
+shows its episode count and how many you have watched. `All episodes` is still
+there when you would rather search the whole show at once.
+
+Every menu below the first level has a `←  Back` row at the top, and Escape
+steps back one level rather than closing. Escape on the first level closes the
+picker, as before.
+
 Add keybindings to `~/.config/hypr/bindings.lua` — `setup` prints these rather
 than editing the file, because which keys are free is your business:
 

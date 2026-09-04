@@ -185,7 +185,11 @@ tui_main_rows() {
   nav_row "👥  All followed (incl. offline)" "Every channel you follow, live or not." menu follows
 }
 
-tui_submenu() { # tui_submenu <which>
+# Each level writes its own rows file, so stepping back re-reads what was
+# already fetched instead of asking Twitch for it again.
+menu_file() { printf '%s/menu-%s.tsv' "$CACHE_DIR" "$1"; }
+
+tui_submenu_rows() { # tui_submenu_rows <which>; writes rows to stdout
   case "$1" in
     search)
       local q; q="$(ask "Search Twitch…")"
@@ -200,45 +204,80 @@ tui_submenu() { # tui_submenu <which>
                 ((.display_name // .broadcaster_login) + "\u001f"
                   + (if (.game_name // "") == "" then "?" else .game_name end)
                   + "\u001f\u001f" + (.title | clean)),
-                "play", .broadcaster_login ] | @tsv' > "$MENU"
+                "play", .broadcaster_login ] | @tsv'
       ;;
     categories)
       helix "/games/top?first=100" | jq -r '
         .data[]? | [ "📂  " + .name,
                      (.box_art_url // "-" | sub("\\{width\\}"; "285") | sub("\\{height\\}"; "380")),
-                     .name, "game", .id ] | @tsv' > "$MENU"
+                     .name, "game", .id, .name ] | @tsv'
       ;;
-    top)     helix "/streams?first=100" | jq -r "$jq_stream_rows" > "$MENU" ;;
+    top)     helix "/streams?first=100" | jq -r "$jq_stream_rows" ;;
     follows)
       helix "/channels/followed?user_id=$(user_id)&first=100" \
         | jq -r '.data[]? | [ "   " + .broadcaster_name, "-",
                               (.broadcaster_name + "\u001f\u001fFollowed channel. Offline channels cannot be played."),
-                              "play", .broadcaster_login ] | @tsv' > "$MENU"
-      ;;
-  esac
-  [[ -s $MENU ]] || return 1
-  tui_route "$(pick "$MENU" "Twitch")"
-}
-
-tui_route() { # tui_route "<action>\t<value>"
-  local action value
-  [[ -n ${1:-} ]] || return 1
-  IFS=$'\t' read -r action value <<< "$1"
-  case "$action" in
-    play) emit "$value" ;;
-    menu) tui_submenu "$value" ;;
-    game)
-      helix "/streams?game_id=$value&first=100" | jq -r "$jq_stream_rows" > "$MENU"
-      [[ -s $MENU ]] || return 1
-      tui_route "$(pick "$MENU" "Twitch")"
+                              "play", .broadcaster_login ] | @tsv'
       ;;
   esac
 }
 
+submenu_label() { # submenu_label <which>; the prompt shown for that level
+  case "$1" in
+    search)     printf 'Twitch · search' ;;
+    categories) printf 'Twitch · categories' ;;
+    top)        printf 'Twitch · top' ;;
+    follows)    printf 'Twitch · followed' ;;
+    game)       printf 'Twitch · %s' "${2:-category}" ;;
+    *)          printf 'Twitch' ;;
+  esac
+}
+
+# The menu is a stack of levels rather than nested calls, so Escape and the
+# "← Back" row pop one instead of tearing the whole thing down. Only the top
+# level has nowhere above it: Escape closes there.
 cmd_browse_tui() {
   ensure_token
-  tui_main_rows > "$MENU"
-  tui_route "$(pick "$MENU" "Twitch")" || true
+  local -a labels=()
+  local depth picked action value extra rows f
+
+  tui_main_rows > "$(menu_file 0)"
+  labels=("Twitch")
+
+  while (( ${#labels[@]} > 0 )); do
+    depth=$(( ${#labels[@]} - 1 ))
+    f="$(menu_file "$depth")"
+    [[ -s $f ]] || { unset "labels[$depth]"; continue; }
+
+    if (( depth > 0 )); then
+      picked="$(pick "$f" "${labels[$depth]}" back)" || return 1
+    else
+      picked="$(pick "$f" "${labels[$depth]}")" || return 1
+    fi
+
+    if [[ -z $picked ]] || is_back "$picked"; then
+      (( depth == 0 )) && return 1
+      unset "labels[$depth]"
+      continue
+    fi
+
+    IFS=$'\t' read -r action value extra <<< "$picked"
+    case "$action" in
+      play) emit "$value"; return 0 ;;
+      menu)
+        rows="$(tui_submenu_rows "$value")" || continue
+        [[ -n $rows ]] || continue
+        { back_row; printf '%s\n' "$rows"; } > "$(menu_file $(( depth + 1 )))"
+        labels+=("$(submenu_label "$value")")
+        ;;
+      game)
+        rows="$(helix "/streams?game_id=$value&first=100" | jq -r "$jq_stream_rows")"
+        [[ -n $rows ]] || continue
+        { back_row; printf '%s\n' "$rows"; } > "$(menu_file $(( depth + 1 )))"
+        labels+=("$(submenu_label game "${extra:-$value}")")
+        ;;
+    esac
+  done
 }
 
 cmd_browse() {

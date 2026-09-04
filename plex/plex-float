@@ -34,6 +34,8 @@ PLEX_PRODUCT="plex-float"
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/plex-float"
 INDEX="$CACHE_DIR/index.tsv"
 EPISODES="$CACHE_DIR/episodes.tsv"
+SEASONS="$CACHE_DIR/seasons.tsv"
+SHOW_JSON="$CACHE_DIR/show.json"
 
 # Rebuild the library index if it is older than this many seconds.
 INDEX_MAX_AGE=86400
@@ -321,33 +323,93 @@ index_is_stale() {
   (( age > INDEX_MAX_AGE ))
 }
 
-pick_episode() { # pick_episode <showRatingKey>; echoes "<ratingKey>\t<type>"
-  api "/library/metadata/$1/allLeaves" | jq -r "$JQ_DEFS"'
-    def info:
-      "S" + ((.parentIndex // 0)|pad2) + "E" + ((.index // 0)|pad2) + "  " + .title
-      + "\u001f" + (.grandparentTitle // "")
-      + (if .duration then "  ·  " + (.duration|hms) else "" end)
-      + (if (.viewOffset // 0) > 0 then "  ·  resume at " + (.viewOffset|hms)
-         elif (.viewCount // 0) > 0 then "  ·  watched"
-         else "" end)
-      + "\u001f\u001f" + (.summary | clean);
-    def row($label): [ $label, (.thumb // "-"), info, (.ratingKey|tostring), "episode" ] | @tsv;
-    [ .MediaContainer.Metadata[]? ] as $eps
-    | ( ( [ $eps[] | select((.viewOffset // 0) > 0) ][0] )
-        // ( [ $eps[] | select((.viewCount // 0) == 0) ][0] )
-        // $eps[0] ) as $next
-    | ( if $next then
-          $next | row("▶  Next up:  S" + ((.parentIndex // 0)|pad2)
-                       + "E" + ((.index // 0)|pad2) + "  " + .title)
-        else empty end ),
-      ( $eps[]
-        | row("S" + ((.parentIndex // 0)|pad2) + "E" + ((.index // 0)|pad2) + "  " + .title
-              + (if (.viewOffset // 0) > 0 then "    ⏸ resume"
-                 elif (.viewCount // 0) > 0 then "    ✓"
-                 else "" end)) )
-  ' > "$EPISODES"
-  [[ -s $EPISODES ]] || die "That show has no episodes"
-  pick "$EPISODES" "Episode"
+# ── Show navigation ─────────────────────────────────────────────────────────
+# One /allLeaves call carries what both levels need: every episode names its
+# season through parentIndex, parentTitle and parentThumb, so the season list
+# is a grouping of the episode list rather than a second request.
+
+load_show() { # load_show <showRatingKey>
+  [[ ${SHOW_CACHED:-} == "$1" && -s $SHOW_JSON ]] && return 0
+  api "/library/metadata/$1/allLeaves" > "$SHOW_JSON" || return 1
+  [[ -s $SHOW_JSON ]] || return 1
+  SHOW_CACHED="$1"
+}
+
+# The episode a person most likely wants next: whatever they paused, else the
+# first unwatched, else the first there is.
+JQ_NEXT='( [ $eps[] | select((.viewOffset // 0) > 0) ][0] )
+         // ( [ $eps[] | select((.viewCount // 0) == 0) ][0] )
+         // $eps[0]'
+
+# Rows are "<label>\t<thumb>\t<info>\t<kind>\t<value>". The kind tells the
+# caller what a pick means, so the menu loop never has to guess from the label.
+JQ_EP_ROW='def ep_row($label):
+    [ $label,
+      (.thumb // "-"),
+      ( "S" + ((.parentIndex // 0)|pad2) + "E" + ((.index // 0)|pad2) + "  " + .title
+        + "\u001f" + (.grandparentTitle // "")
+        + (if .duration then "  ·  " + (.duration|hms) else "" end)
+        + (if (.viewOffset // 0) > 0 then "  ·  resume at " + (.viewOffset|hms)
+           elif (.viewCount // 0) > 0 then "  ·  watched"
+           else "" end)
+        + "\u001f\u001f" + (.summary | clean) ),
+      "play",
+      (.ratingKey|tostring) ]
+    | @tsv;'
+
+show_title() { jq -r '.MediaContainer.Metadata[0].grandparentTitle // "Show"' "$SHOW_JSON"; }
+
+pick_season() { # pick_season; echoes "<kind>\t<value>"
+  { back_row
+    jq -r "$JQ_DEFS$JQ_EP_ROW"'
+      [ .MediaContainer.Metadata[]? ] as $eps
+      | ( '"$JQ_NEXT"' ) as $next
+      | ( if $next then
+            $next
+            | ep_row("▶  Next up:  S" + ((.parentIndex // 0)|pad2)
+                     + "E" + ((.index // 0)|pad2) + "  " + .title)
+          else empty end ),
+        ( $eps
+          | group_by(.parentIndex // 0)
+          | .[]
+          | ( [ .[] | select((.viewCount // 0) > 0) ] | length ) as $seen
+          | length as $n
+          | .[0] as $first
+          | [ ($first.parentTitle // ("Season " + (($first.parentIndex // 0)|tostring)))
+                + "    ·  " + ($n|tostring) + " episode" + (if $n == 1 then "" else "s" end)
+                + (if $seen == $n then "    ✓"
+                   elif $seen > 0 then "    ·  " + ($seen|tostring) + " watched"
+                   else "" end),
+              ($first.parentThumb // $first.grandparentThumb // "-"),
+              ( ($first.parentTitle // "Season")
+                + "\u001f" + ($first.grandparentTitle // "")
+                + "  ·  " + ($n|tostring) + " episodes"
+                + (if $seen > 0 then "  ·  " + ($seen|tostring) + " watched" else "" end) ),
+              "season",
+              (($first.parentIndex // 0)|tostring) ]
+          | @tsv )
+    ' "$SHOW_JSON"
+    printf 'All episodes\t-\t\tall\t-\n'
+  } > "$SEASONS"
+  [[ -s $SEASONS ]] || die "That show has no episodes"
+  pick "$SEASONS" "$(show_title)" back
+}
+
+pick_episodes() { # pick_episodes <season-index|all>; echoes "<kind>\t<value>"
+  local season="$1" prompt
+  if [[ $season == all ]]; then prompt="$(show_title)"
+  else prompt="$(show_title) · Season $season"; fi
+  { back_row
+    jq -r --arg season "$season" "$JQ_DEFS$JQ_EP_ROW"'
+      .MediaContainer.Metadata[]?
+      | select($season == "all" or ((.parentIndex // 0)|tostring) == $season)
+      | ep_row("S" + ((.parentIndex // 0)|pad2) + "E" + ((.index // 0)|pad2) + "  " + .title
+               + (if (.viewOffset // 0) > 0 then "    ⏸ resume"
+                  elif (.viewCount // 0) > 0 then "    ✓"
+                  else "" end))
+    ' "$SHOW_JSON"
+  } > "$EPISODES"
+  pick "$EPISODES" "$prompt" back
 }
 
 # ── Playback ────────────────────────────────────────────────────────────────
@@ -440,19 +502,47 @@ cmd_session() { # runs detached: plays <ratingKey>, then rolls into the next
   done
 }
 
+# The menu is a small state machine rather than a straight run of prompts, so
+# Escape and the "← Back" row can pop a level instead of tearing the whole
+# thing down. Only the library level has nowhere above it: Escape closes there.
 search_tui() { # runs inside the picker window
   load_config
-  local picked rk type
-  picked="$(pick "$INDEX" "Plex")" || return 1
-  IFS=$'\t' read -r rk type <<< "$picked"
-  [[ ${rk:-} =~ ^[0-9]+$ ]] || return 1
-
-  if [[ $type == "show" ]]; then
-    picked="$(pick_episode "$rk")" || return 1
-    IFS=$'\t' read -r rk type <<< "$picked"
-    [[ ${rk:-} =~ ^[0-9]+$ ]] || return 1
-  fi
-  emit "$rk"
+  local state=library picked rk type kind val show_rk="" season=""
+  while :; do
+    case $state in
+      library)
+        picked="$(pick "$INDEX" "Plex")" || return 1
+        IFS=$'\t' read -r rk type <<< "$picked"
+        [[ ${rk:-} =~ ^[0-9]+$ ]] || return 1
+        if [[ $type == "show" ]]; then
+          load_show "$rk" || die "Could not load that show's episodes"
+          show_rk="$rk"; state=seasons
+        else
+          emit "$rk"; return 0
+        fi
+        ;;
+      seasons)
+        picked="$(pick_season)" || return 1
+        IFS=$'\t' read -r kind val <<< "$picked"
+        case "$kind" in
+          "$FLOAT_BACK") state=library ;;
+          play)          emit "$val"; return 0 ;;
+          season)        season="$val"; state=episodes ;;
+          all)           season=all;   state=episodes ;;
+          *)             return 1 ;;
+        esac
+        ;;
+      episodes)
+        picked="$(pick_episodes "$season")" || return 1
+        IFS=$'\t' read -r kind val <<< "$picked"
+        case "$kind" in
+          "$FLOAT_BACK") state=seasons ;;
+          play)          emit "$val"; return 0 ;;
+          *)             return 1 ;;
+        esac
+        ;;
+    esac
+  done
 }
 
 cmd_search() {
