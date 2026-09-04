@@ -540,7 +540,7 @@ cmd_session() { # runs detached: plays <ratingKey>, then rolls into the next
 # thing down. Only the library level has nowhere above it: Escape closes there.
 search_tui() { # runs inside the picker window
   load_config
-  local state=libraries picked rk type kind val show_rk="" season="" library=""
+  local state=libraries picked rk type _lib kind val show_rk="" season="" library=""
   while :; do
     case $state in
       libraries)
@@ -555,7 +555,10 @@ search_tui() { # runs inside the picker window
       library)
         picked="$(pick_in_library "$library")" || return 1
         if is_back "$picked"; then state=libraries; continue; fi
-        IFS=$'\t' read -r rk type <<< "$picked"
+        # Index rows carry a library column after the type. read gives the last
+        # variable everything that is left, so without somewhere to put it the
+        # library name lands in $type and no row ever looks like a show.
+        IFS=$'\t' read -r rk type _lib <<< "$picked"
         [[ ${rk:-} =~ ^[0-9]+$ ]] || return 1
         if [[ $type == "show" ]]; then
           load_show "$rk" || die "Could not load that show's episodes"
