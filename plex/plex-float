@@ -36,6 +36,8 @@ INDEX="$CACHE_DIR/index.tsv"
 EPISODES="$CACHE_DIR/episodes.tsv"
 SEASONS="$CACHE_DIR/seasons.tsv"
 LIBRARIES="$CACHE_DIR/libraries.tsv"
+MENU_STATE="$CACHE_DIR/menu-state"
+RESUME_FILE="$CONFIG_DIR/resume"
 LIBVIEW="$CACHE_DIR/library.tsv"
 SHOW_JSON="$CACHE_DIR/show.json"
 
@@ -281,6 +283,13 @@ JQ_DEFS='
            | if . >= 60 then ((. / 60 | floor)|tostring) + "h " + ((. % 60)|tostring) + "m"
              else (tostring) + "m" end;
   def pad2: tostring | if length < 2 then "0" + . else . end;
+  def plural($n; $w): ($n|tostring) + " " + $w + (if $n == 1 then "" else "s" end);
+  def size_h: if . >= 1073741824
+              then ((. / 1073741824 * 10 | round) / 10 | tostring) + " GB"
+              else ((. / 1048576 | round) | tostring) + " MB" end;
+  def ymd: (. | gmtime | strftime("%d %b %Y"));
+  def tagged($k): ([ $k[]?.tag ] | join(", "));
+  def nonempty: map(select(. != null and . != "")) | join("  ·  ");
 '
 
 build_index() {
@@ -302,14 +311,31 @@ build_index() {
           + (if .year then "  (" + (.year|tostring) + ")" else "" end)
           + "    ·  " + $lib,
           (.thumb // "-"),
-          ( .title
-            + (if .year then " (" + (.year|tostring) + ")" else "" end)
-            + "\u001f" + $lib
-            + (if $type == "show"
-               then (if .childCount then "  ·  " + (.childCount|tostring) + " seasons" else "" end)
-               else (if .duration then "  ·  " + (.duration|hms) else "" end) end)
-            + (if (.contentRating // "") != "" then "  ·  " + .contentRating else "" end)
-            + "\u001f\u001f" + (.summary | clean) ),
+          ( . as $m | (.Media[0] // {}) as $md
+            | [ ($m.title | clean)
+                  + (if $m.year then "  (" + ($m.year|tostring) + ")" else "" end),
+                ( [ $lib,
+                    (if $type == "show" then plural($m.childCount // 0; "season") else null end),
+                    (if $type == "show" and $m.leafCount
+                     then plural($m.leafCount; "episode") else null end),
+                    (if $type == "show" and ($m.viewedLeafCount // 0) > 0
+                     then ($m.viewedLeafCount|tostring) + " watched" else null end),
+                    (if $type != "show" and $m.duration then ($m.duration|hms) else null end),
+                    $m.contentRating,
+                    (if $m.rating then "★ " + ($m.rating|tostring) else null end),
+                    (if $m.audienceRating then "👥 " + ($m.audienceRating|tostring) else null end)
+                  ] | nonempty ),
+                ( [ (if ($m.Genre // []) != [] then tagged($m.Genre) else null end),
+                    $m.studio ] | nonempty ),
+                ( [ (if $md.videoResolution then ($md.videoResolution|tostring) + "p" else null end),
+                    $md.videoCodec,
+                    (if $md.audioChannels then ($md.audioChannels|tostring) + "ch" else null end),
+                    (if ($md.Part[0].size // null) then ($md.Part[0].size | size_h) else null end)
+                  ] | nonempty ),
+                (if $m.addedAt then "Added " + ($m.addedAt | ymd) else null end)
+              ]
+            | map(select(. != null and . != "")) | join("\u001f")
+            | . + "\u001f\u001f" + ($m.summary | clean) ),
           (.ratingKey|tostring),
           $type,
           $lib ]
@@ -327,6 +353,33 @@ index_is_stale() {
   (( $(head -1 "$INDEX" | awk -F'\t' '{print NF}') < 6 )) && return 0
   local age=$(( $(date +%s) - $(stat -c %Y "$INDEX") ))
   (( age > INDEX_MAX_AGE ))
+}
+
+# ── Picker position ─────────────────────────────────────────────────────────
+# The menu is a state machine, not a stack of files, so its position is the
+# four variables that decide which level draws next. Each level's rows are
+# already cached, so restoring those variables walks straight back in.
+
+resume_enabled() { [[ "$(cat "$RESUME_FILE" 2>/dev/null || echo on)" == on ]]; }
+
+save_menu_state() {
+  printf '%s\n%s\n%s\n%s\n' "$state" "$library" "$show_rk" "$season" > "$MENU_STATE"
+}
+
+restore_menu_state() {
+  [[ -s $MENU_STATE ]] || return 0
+  local -a v=()
+  mapfile -t v < "$MENU_STATE"
+  (( ${#v[@]} >= 4 )) || return 0
+  case "${v[0]}" in libraries|library|seasons|episodes) ;; *) return 0 ;; esac
+  state="${v[0]}"; library="${v[1]}"; show_rk="${v[2]}"; season="${v[3]}"
+  # The two show levels cannot draw without the episode list behind them.
+  if [[ $state == seasons || $state == episodes ]]; then
+    if [[ -z $show_rk ]] || ! load_show "$show_rk"; then state=libraries; fi
+  fi
+  # A library level with no library chosen is the library list.
+  [[ $state == library && -z $library ]] && state=libraries
+  return 0
 }
 
 # ── Library navigation ──────────────────────────────────────────────────────
@@ -521,7 +574,7 @@ next_episode() { # next_episode <ratingKey>; echoes the following episode's key
 }
 
 cmd_session() { # runs detached: plays <ratingKey>, then rolls into the next
-  local rk="$1"
+  local rk="$1" from="${2:-}"
   echo "$$" > "$PID_FILE"
   trap 'rm -f "$PID_FILE"' EXIT
   while [[ -n $rk ]]; do
@@ -533,6 +586,13 @@ cmd_session() { # runs detached: plays <ratingKey>, then rolls into the next
       break
     fi
   done
+
+  # Back to the picker, where you left it — once the whole run is over, not
+  # between autoplayed episodes. Only reached when playback ended or you closed
+  # it: starting something else kills this session's process group first.
+  if [[ $from == browse ]] && resume_enabled; then
+    setsid -f "$0" search --resume >/dev/null 2>&1 || true
+  fi
 }
 
 # The menu is a small state machine rather than a straight run of prompts, so
@@ -541,6 +601,7 @@ cmd_session() { # runs detached: plays <ratingKey>, then rolls into the next
 search_tui() { # runs inside the picker window
   load_config
   local state=libraries picked rk type _lib kind val show_rk="" season="" library=""
+  [[ ${PXF_RESUME:-0} == 1 ]] && restore_menu_state
   while :; do
     case $state in
       libraries)
@@ -564,7 +625,7 @@ search_tui() { # runs inside the picker window
           load_show "$rk" || die "Could not load that show's episodes"
           show_rk="$rk"; state=seasons
         else
-          emit "$rk"; return 0
+          save_menu_state; emit "$rk"; return 0
         fi
         ;;
       seasons)
@@ -572,7 +633,7 @@ search_tui() { # runs inside the picker window
         IFS=$'\t' read -r kind val <<< "$picked"
         case "$kind" in
           "$FLOAT_BACK") state=library ;;
-          play)          emit "$val"; return 0 ;;
+          play)          save_menu_state; emit "$val"; return 0 ;;
           season)        season="$val"; state=episodes ;;
           all)           season=all;   state=episodes ;;
           *)             return 1 ;;
@@ -583,7 +644,7 @@ search_tui() { # runs inside the picker window
         IFS=$'\t' read -r kind val <<< "$picked"
         case "$kind" in
           "$FLOAT_BACK") state=seasons ;;
-          play)          emit "$val"; return 0 ;;
+          play)          save_menu_state; emit "$val"; return 0 ;;
           *)             return 1 ;;
         esac
         ;;
@@ -591,7 +652,20 @@ search_tui() { # runs inside the picker window
   done
 }
 
-cmd_search() {
+cmd_resume() { # cmd_resume <on|off|status>
+  case "${1:-status}" in
+    on|off)
+      ( umask 077; mkdir -p "$CONFIG_DIR"; printf '%s\n' "$1" > "$RESUME_FILE" )
+      note "Reopen the picker after playback: $1"
+      ;;
+    status) printf 'Reopen the picker after playback: %s\n' \
+              "$(cat "$RESUME_FILE" 2>/dev/null || echo on)" ;;
+    *) die "Usage: plex-float resume <on|off|status>" ;;
+  esac
+}
+
+cmd_search() { # cmd_search [--resume]
+  [[ ${1:-} == --resume ]] && export PXF_RESUME=1
   load_config
   # Index before the panel opens: it can take a while on a big library, and the
   # picker should come up ready to type into.
@@ -605,13 +679,14 @@ cmd_search() {
   [[ ${rk:-} =~ ^[0-9]+$ ]] || exit 0
 
   stop_existing
-  setsid -f "$0" _session "$rk" >> "$LOG" 2>&1
+  setsid -f "$0" _session "$rk" browse >> "$LOG" 2>&1
 }
 
 cmd_index() { load_config; note "Reindexing your Plex library…"; build_index; note "Indexed $(wc -l < "$INDEX") items"; }
 
 case "${1:-search}" in
-  search)   cmd_search ;;
+  search)   shift || true; cmd_search "${1:-}" ;;
+  resume)   shift || true; cmd_resume "${1:-status}" ;;
   auth)     cmd_auth ;;
   server)   shift || true; cmd_server "$@" ;;
   index)    cmd_index ;;
@@ -628,6 +703,6 @@ case "${1:-search}" in
   toggle)   cmd_toggle ;;
   quit)     cmd_quit ;;
   size)     shift || true; cmd_size "${1:-cycle}" ;;
-  _session) load_config; shift; cmd_session "$1" ;;
-  *)        die "Unknown command: $1 (auth|server|search|index|toggle|quit|size)" ;;
+  _session) load_config; shift; cmd_session "$1" "${2:-}" ;;
+  *)        die "Unknown command: $1 (auth|server|search|index|resume|toggle|quit|size)" ;;
 esac

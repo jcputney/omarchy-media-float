@@ -71,6 +71,28 @@ Picking a TV show opens its seasons, with the episode you are part-way through
 shows its episode count and how many you have watched. `All episodes` is still
 there when you would rather search the whole show at once.
 
+
+## Back to where you were
+
+When playback ends — or you close it — the picker reopens on the level you left
+it, with the same rows and the same cursor. Starting something else does not do
+this: the old session is stopped to make way for the new one.
+
+```bash
+plex-float resume off      # stop and stay out of the picker
+plex-float resume on       # the default
+plex-float resume status
+```
+
+Autoplay counts as one run: rolling from one episode into the next does not
+reopen anything, only the end of the whole run does.
+
+The preview pane shows what Plex already knows about an item — runtime or season
+and episode counts, how many you have watched, content rating, critic and
+audience scores, genres, studio, resolution, codec, channels, file size, and the
+date it was added. None of it costs an extra request; it comes from the same
+call that builds the index.
+
 Every menu below the first level has a `←  Back` row at the top, and Escape
 steps back one level rather than closing. Escape on the first level closes the
 picker, as before.

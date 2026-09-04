@@ -160,16 +160,23 @@ jq_stream_rows='
   def clean: (. // "") | gsub("[\t\n\r]"; " ");
   .data[]?
   | ((now - (.started_at | fromdateiso8601)) | floor) as $up
+  | (.title | clean) as $ttl
   | [ "●  " + (.user_name // .user_login)
         + "   —   " + (if (.game_name // "") == "" then "?" else .game_name end)
         + "   ·  " + (.viewer_count // 0 | viewers),
       (.thumbnail_url // "-" | sub("\\{width\\}"; "640") | sub("\\{height\\}"; "360")),
-      ((.user_name // .user_login)
-        + "\u001f" + (if (.game_name // "") == "" then "?" else .game_name end)
-        + "\u001f" + (.viewer_count // 0 | tostring) + " viewers  ·  live "
-        + ($up / 3600 | floor | tostring) + "h "
-        + (($up % 3600) / 60 | floor | tostring) + "m"
-        + "\u001f\u001f" + (.title | clean)),
+      ([ (.user_name // .user_login),
+         (if (.game_name // "") == "" then "?" else .game_name end),
+         ( [ (.viewer_count // 0 | tostring) + " viewers",
+             "live " + ($up / 3600 | floor | tostring) + "h "
+                     + (($up % 3600) / 60 | floor | tostring) + "m",
+             (if (.language // "") != "" then (.language | ascii_upcase) else null end),
+             (if (.is_mature // false) then "18+" else null end)
+           ] | map(select(. != null)) | join("  ·  ") ),
+         (if ((.tags // []) | length) > 0
+          then ((.tags // []) | join(", ")) else null end)
+       ] | map(select(. != null and . != "")) | join("\u001f")
+       | . + "\u001f\u001f" + $ttl),
       "play",
       .user_login ]
   | @tsv'
@@ -262,6 +269,28 @@ tui_main_rows() {
 # already fetched instead of asking Twitch for it again.
 menu_file() { printf '%s/menu-%s.tsv' "$CACHE_DIR" "$1"; }
 
+# Where the picker was when you chose a channel. Every level's rows are already
+# on disk, so remembering the labels is enough to walk back into them.
+MENU_STATE="$CACHE_DIR/menu-state"
+RESUME_FILE="$CONFIG_DIR/resume"
+
+resume_enabled() { [[ "$(cat "$RESUME_FILE" 2>/dev/null || echo on)" == on ]]; }
+
+save_menu_state() { printf '%s\n' "${labels[@]}" > "$MENU_STATE"; }
+
+# Only restore a stack whose every level still has its rows. A half-present
+# stack would open on a level you cannot back out of.
+restore_menu_state() {
+  [[ -s $MENU_STATE ]] || return 0
+  local -a saved=(); local d
+  mapfile -t saved < "$MENU_STATE"
+  (( ${#saved[@]} > 0 )) || return 0
+  for (( d = 0; d < ${#saved[@]}; d++ )); do
+    [[ -s "$(menu_file "$d")" ]] || return 0
+  done
+  labels=("${saved[@]}")
+}
+
 tui_submenu_rows() { # tui_submenu_rows <which>; writes rows to stdout
   case "$1" in
     search)
@@ -326,8 +355,11 @@ cmd_browse_tui() {
   local -a labels=()
   local depth picked action value extra rows f
 
-  tui_main_rows > "$(menu_file 0)"
-  labels=("Twitch")
+  [[ ${TWF_RESUME:-0} == 1 ]] && restore_menu_state
+  if (( ${#labels[@]} == 0 )); then
+    tui_main_rows > "$(menu_file 0)"
+    labels=("Twitch")
+  fi
 
   while (( ${#labels[@]} > 0 )); do
     depth=$(( ${#labels[@]} - 1 ))
@@ -348,7 +380,7 @@ cmd_browse_tui() {
 
     IFS=$'\t' read -r action value extra <<< "$picked"
     case "$action" in
-      play) emit "$value"; return 0 ;;
+      play) save_menu_state; emit "$value"; return 0 ;;
       setlang)
         # The choice changes what every level would show, so save it and
         # collapse back to the first screen rather than leaving stale rows
@@ -373,19 +405,20 @@ cmd_browse_tui() {
   done
 }
 
-cmd_browse() {
+cmd_browse() { # cmd_browse [--resume]
   local login
+  [[ ${1:-} == --resume ]] && export TWF_RESUME=1
   login="$(run_menu "$SELF _browse_tui")"
   [[ -n $login ]] || exit 0
   ensure_token
-  start_stream "$login"
+  start_stream "$login" browse
 }
 
 # ── Playback ────────────────────────────────────────────────────────────────
 
 quality() { cat "$QUALITY_FILE" 2>/dev/null || echo "$DEFAULT_QUALITY"; }
 
-start_stream() { # start_stream <login>
+start_stream() { # start_stream <login> [browse]
   [[ -n ${1:-} ]] || exit 0
   # Offline channels are reachable from the "All followed" list, and streamlink
   # simply finds no streams and exits, leaving no window and no explanation.
@@ -394,12 +427,12 @@ start_stream() { # start_stream <login>
     || die "$1 is not live right now"
   stop_existing
   printf '%s\n' "$1" > "$CHANNEL_FILE"
-  setsid -f "$0" _session "$1" >> "$LOG" 2>&1
+  setsid -f "$0" _session "$1" "${2:-}" >> "$LOG" 2>&1
   note "Opening $1…"
 }
 
-cmd_session() { # cmd_session <login>
-  local login="$1" mpv_pid
+cmd_session() { # cmd_session <login> [browse]
+  local login="$1" from="${2:-}" mpv_pid
   echo "$$" > "$PID_FILE"
   # setsid gives this session its own process group, so killing the group on the
   # way out takes streamlink with it.
@@ -424,6 +457,13 @@ cmd_session() { # cmd_session <login>
   if (( $(date +%s) - started < 10 )); then
     note "$(grep -m1 -i "error" "$err" 2>/dev/null || echo "$login stopped unexpectedly")"
   fi
+
+  # Back to the picker, where you left it. Only reached when the stream ended
+  # or you closed it: opening another channel kills this session's process
+  # group first, so a superseded session never gets here.
+  if [[ $from == browse ]] && resume_enabled; then
+    setsid -f "$0" browse --resume >/dev/null 2>&1 || true
+  fi
 }
 
 cmd_quality() {
@@ -441,6 +481,18 @@ cmd_quality() {
   if [[ -s $CHANNEL_FILE && "$(overlay_field .class)" == "$APP_ID" ]]; then
     start_stream "$(cat "$CHANNEL_FILE")"
   fi
+}
+
+cmd_resume() { # cmd_resume <on|off|status>
+  case "${1:-status}" in
+    on|off)
+      ( umask 077; mkdir -p "$CONFIG_DIR"; printf '%s\n' "$1" > "$RESUME_FILE" )
+      note "Reopen the picker after a stream: $1"
+      ;;
+    status) printf 'Reopen the picker after a stream: %s\n' \
+              "$(cat "$RESUME_FILE" 2>/dev/null || echo on)" ;;
+    *) die "Usage: twitch-float resume <on|off|status>" ;;
+  esac
 }
 
 cmd_language() { # cmd_language [code|any|--list]
@@ -463,7 +515,8 @@ cmd_language() { # cmd_language [code|any|--list]
 case "${1:-browse}" in
   auth)     cmd_auth ;;
   language) shift || true; cmd_language "${1:---list}" ;;
-  browse)   cmd_browse ;;
+  resume)   shift || true; cmd_resume "${1:-status}" ;;
+  browse)   shift || true; cmd_browse "${1:-}" ;;
   _browse_tui) cmd_browse_tui ;;
   _preview) shift || true; render_preview "${1:--}" "${2:--}" ;;
   play)     shift; ensure_token; start_stream "${1:?channel login required}" ;;
@@ -471,6 +524,6 @@ case "${1:-browse}" in
   toggle)   cmd_toggle ;;
   quit)     cmd_quit ;;
   size)     shift || true; cmd_size "${1:-cycle}" ;;
-  _session) shift; cmd_session "$1" ;;
-  *)        die "Unknown command: $1 (auth|browse|play|quality|language|toggle|quit|size)" ;;
+  _session) shift; cmd_session "$1" "${2:-}" ;;
+  *)        die "Unknown command: $1 (auth|browse|play|quality|language|resume|toggle|quit|size)" ;;
 esac

@@ -88,6 +88,22 @@ There is no "categories you follow" list, because Twitch's public API has no
 endpoint for one — `/channels/followed` returns channels only. The categories
 tab on twitch.tv is served by a private API this plugin cannot use.
 
+
+## Back to where you were
+
+When playback ends — or you close it — the picker reopens on the level you left
+it, with the same rows and the same cursor. Starting something else does not do
+this: the old session is stopped to make way for the new one.
+
+```bash
+twitch-float resume off      # stop and stay out of the picker
+twitch-float resume on       # the default
+twitch-float resume status
+```
+
+The preview pane shows viewers, uptime, stream language, an 18+ marker where
+Twitch sets one, the channel's tags, and the stream title.
+
 Every menu below the first level has a `←  Back` row at the top, and Escape
 steps back one level rather than closing. Escape on the first level closes the
 picker, as before.
