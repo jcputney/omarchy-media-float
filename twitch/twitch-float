@@ -32,6 +32,7 @@ CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/twitch-float"
 MENU="$CACHE_DIR/menu.tsv"
 CHANNEL_FILE="$RUN_DIR/twitch-channel"
 QUALITY_FILE="$CONFIG_DIR/quality"
+LANGUAGE_FILE="$CONFIG_DIR/language"
 
 SCOPES="user:read:follows"
 DEFAULT_QUALITY="720p60,720p,best"
@@ -173,6 +174,74 @@ jq_stream_rows='
       .user_login ]
   | @tsv'
 
+# ── Language filter ─────────────────────────────────────────────────────────
+# Helix filters /streams by language server-side, so the top list and every
+# category honour it for free. /search/channels ignores the parameter, so that
+# one is filtered here on broadcaster_language instead.
+#
+# Your own follows are deliberately exempt. Following someone is a stronger
+# signal than a language preference, and hiding a channel you chose to follow
+# because it streams in another language would be a bug, not a filter.
+
+# Twitch reports stream language as ISO 639-1. This is the set it actually
+# populates in volume, not the whole standard.
+LANGUAGES='any:Any language
+en:English
+es:Spanish
+pt:Portuguese
+fr:French
+de:German
+it:Italian
+ru:Russian
+ja:Japanese
+ko:Korean
+zh:Chinese
+th:Thai
+tr:Turkish
+pl:Polish
+nl:Dutch
+sv:Swedish
+da:Danish
+no:Norwegian
+fi:Finnish
+cs:Czech
+hu:Hungarian
+el:Greek
+ar:Arabic
+he:Hebrew
+id:Indonesian
+vi:Vietnamese
+hi:Hindi
+uk:Ukrainian
+ro:Romanian
+ca:Catalan'
+
+language() { cat "$LANGUAGE_FILE" 2>/dev/null || echo any; }
+
+language_name() { # language_name <code>
+  local n
+  n="$(printf '%s\n' "$LANGUAGES" | awk -F: -v c="${1:-any}" '$1 == c { print $2 }')"
+  printf '%s' "${n:-$1}"
+}
+
+# Appended to a /streams query. Empty when the filter is off, so the URL is
+# unchanged from before this existed.
+lang_q() {
+  local l; l="$(language)"
+  [[ $l == any ]] && return 0
+  printf '&language=%s' "$l"
+}
+
+language_rows() {
+  local cur; cur="$(language)"
+  printf '%s\n' "$LANGUAGES" | while IFS=: read -r code name; do
+    [[ -n $code ]] || continue
+    printf '%s  %s\t-\t%s\u001f\u001fStreams tagged %s.\tsetlang\t%s\n' \
+      "$([[ $code == "$cur" ]] && printf '●' || printf ' ')" \
+      "$name" "$name" "$name" "$code"
+  done
+}
+
 live_follows() { helix "/streams/followed?user_id=$(user_id)&first=100" | jq -r "$jq_stream_rows"; }
 
 nav_row() { printf '%s\t-\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4"; }
@@ -184,6 +253,9 @@ tui_main_rows() {
   nav_row "📂  Browse categories…"           "Pick a game or category, then a stream." menu categories
   nav_row "🔥  Top streams right now"        "The biggest live streams on Twitch." menu top
   nav_row "👥  All followed (incl. offline)" "Every channel you follow, live or not." menu follows
+  nav_row "🌐  Language: $(language_name "$(language)")" \
+    "Filters top streams and categories. Search is filtered too. Your own follows are always shown, whatever they stream in." \
+    menu language
 }
 
 # Each level writes its own rows file, so stepping back re-reads what was
@@ -196,9 +268,10 @@ tui_submenu_rows() { # tui_submenu_rows <which>; writes rows to stdout
       local q; q="$(ask "Search Twitch…")"
       [[ -n $q ]] || return 1
       helix "/search/channels?live_only=true&first=50&query=$(printf %s "$q" | jq -sRr @uri)" \
-        | jq -r '
+        | jq -r --arg lang "$(language)" '
             def clean: (. // "") | gsub("[\t\n\r]"; " ");
             .data[]?
+            | select($lang == "any" or (.broadcaster_language // "") == $lang)
             | [ "●  " + (.display_name // .broadcaster_login)
                   + "   —   " + (if (.game_name // "") == "" then "?" else .game_name end),
                 (.thumbnail_url // "-"),
@@ -221,7 +294,8 @@ tui_submenu_rows() { # tui_submenu_rows <which>; writes rows to stdout
                      (.box_art_url // "-" | sub("\\{width\\}"; "285") | sub("\\{height\\}"; "380")),
                      .name, "game", .id, .name ] | @tsv'
       ;;
-    top)     helix "/streams?first=100" | jq -r "$jq_stream_rows" ;;
+    language) language_rows ;;
+    top)     helix "/streams?first=100$(lang_q)" | jq -r "$jq_stream_rows" ;;
     follows)
       helix "/channels/followed?user_id=$(user_id)&first=100" \
         | jq -r '.data[]? | [ "   " + .broadcaster_name, "-",
@@ -233,6 +307,7 @@ tui_submenu_rows() { # tui_submenu_rows <which>; writes rows to stdout
 
 submenu_label() { # submenu_label <which>; the prompt shown for that level
   case "$1" in
+    language)   printf 'Twitch · language' ;;
     search)     printf 'Twitch · channel search' ;;
     gamesearch) printf 'Twitch · category search' ;;
     categories) printf 'Twitch · categories' ;;
@@ -274,6 +349,14 @@ cmd_browse_tui() {
     IFS=$'\t' read -r action value extra <<< "$picked"
     case "$action" in
       play) emit "$value"; return 0 ;;
+      setlang)
+        # The choice changes what every level would show, so save it and
+        # collapse back to the first screen rather than leaving stale rows
+        # further up the stack.
+        ( umask 077; printf '%s\n' "$value" > "$LANGUAGE_FILE" )
+        tui_main_rows > "$(menu_file 0)"
+        labels=("Twitch")
+        ;;
       menu)
         rows="$(tui_submenu_rows "$value")" || continue
         [[ -n $rows ]] || continue
@@ -281,7 +364,7 @@ cmd_browse_tui() {
         labels+=("$(submenu_label "$value")")
         ;;
       game)
-        rows="$(helix "/streams?game_id=$value&first=100" | jq -r "$jq_stream_rows")"
+        rows="$(helix "/streams?game_id=$value&first=100$(lang_q)" | jq -r "$jq_stream_rows")"
         [[ -n $rows ]] || continue
         { back_row; printf '%s\n' "$rows"; } > "$(menu_file $(( depth + 1 )))"
         labels+=("$(submenu_label game "${extra:-$value}")")
@@ -360,8 +443,26 @@ cmd_quality() {
   fi
 }
 
+cmd_language() { # cmd_language [code|any|--list]
+  local want="${1:---list}"
+  if [[ $want == --list ]]; then
+    printf 'Language filter: %s\n\n' "$(language_name "$(language)")"
+    printf '%s\n' "$LANGUAGES" | while IFS=: read -r code name; do
+      printf '  %s %-6s %s\n' \
+        "$([[ $code == "$(language)" ]] && printf '*' || printf ' ')" "$code" "$name"
+    done
+    return 0
+  fi
+  printf '%s\n' "$LANGUAGES" | awk -F: -v c="$want" 'BEGIN{ok=1} $1 == c {ok=0} END{exit ok}' \
+    || die "Unknown language: $want (try: twitch-float language --list)"
+  load_config
+  ( umask 077; mkdir -p "$CONFIG_DIR"; printf '%s\n' "$want" > "$LANGUAGE_FILE" )
+  note "Language: $(language_name "$want")"
+}
+
 case "${1:-browse}" in
   auth)     cmd_auth ;;
+  language) shift || true; cmd_language "${1:---list}" ;;
   browse)   cmd_browse ;;
   _browse_tui) cmd_browse_tui ;;
   _preview) shift || true; render_preview "${1:--}" "${2:--}" ;;
@@ -371,5 +472,5 @@ case "${1:-browse}" in
   quit)     cmd_quit ;;
   size)     shift || true; cmd_size "${1:-cycle}" ;;
   _session) shift; cmd_session "$1" ;;
-  *)        die "Unknown command: $1 (auth|browse|play|quality|toggle|quit|size)" ;;
+  *)        die "Unknown command: $1 (auth|browse|play|quality|language|toggle|quit|size)" ;;
 esac

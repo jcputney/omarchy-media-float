@@ -60,11 +60,29 @@ echo 'TWITCH_CLIENT_ID=your_id_here' >> ~/.config/twitch-float/config
 twitch-float browse             # follows, categories, top, search
 twitch-float play <channel>     # straight to one channel
 twitch-float quality toggle     # 720p60 <-> source, restarts the stream
+twitch-float language de        # filter discovery to one language
+twitch-float language --list    # every code it accepts
 ```
 
 `Search categories…` looks up a game or category by name and drops you into
 its live streams. `Browse categories…` is the same thing for the top 100
 without typing.
+
+## Language
+
+The first screen has a `🌐  Language` row. Pick one and it sticks — it is saved
+to `~/.config/twitch-float/language` and applies to every later session until
+you change it.
+
+It filters **top streams, categories and channel search**. Twitch filters the
+first two server-side, so you get a full hundred results in your language
+rather than a hundred filtered down to six. Channel search is filtered here,
+because Helix accepts a `language` parameter on that endpoint and then ignores
+it.
+
+**Your own follows are never filtered.** Following someone is a stronger signal
+than a language preference, and hiding a channel you chose to follow because it
+streams in another language would be a bug rather than a feature.
 
 There is no "categories you follow" list, because Twitch's public API has no
 endpoint for one — `/channels/followed` returns channels only. The categories
