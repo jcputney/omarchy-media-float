@@ -61,6 +61,11 @@ plex-float index     # rebuild the library cache by hand
 The library is cached, so the picker opens instantly on a big library. It
 reindexes itself when the cache goes stale.
 
+The picker opens on your libraries — Movies, TV Shows, and whatever else you
+have — so a 2,000-title server is a short list first and a long one only if you
+ask. `View all` searches every library at once, which is what you want when you
+know the title but not where it lives.
+
 Picking a TV show opens its seasons, with the episode you are part-way through
 (or the first you have not seen) pinned at the top as **Next up**. Each season
 shows its episode count and how many you have watched. `All episodes` is still

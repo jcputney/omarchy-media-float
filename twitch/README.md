@@ -62,6 +62,14 @@ twitch-float play <channel>     # straight to one channel
 twitch-float quality toggle     # 720p60 <-> source, restarts the stream
 ```
 
+`Search categories…` looks up a game or category by name and drops you into
+its live streams. `Browse categories…` is the same thing for the top 100
+without typing.
+
+There is no "categories you follow" list, because Twitch's public API has no
+endpoint for one — `/channels/followed` returns channels only. The categories
+tab on twitch.tv is served by a private API this plugin cannot use.
+
 Every menu below the first level has a `←  Back` row at the top, and Escape
 steps back one level rather than closing. Escape on the first level closes the
 picker, as before.

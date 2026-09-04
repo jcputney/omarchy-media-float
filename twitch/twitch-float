@@ -180,6 +180,7 @@ nav_row() { printf '%s\t-\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4"; }
 tui_main_rows() {
   live_follows
   nav_row "🔍  Search channels…"             "Search Twitch for a channel by name." menu search
+  nav_row "🎮  Search categories…"           "Search Twitch for a game or category, then pick a stream." menu gamesearch
   nav_row "📂  Browse categories…"           "Pick a game or category, then a stream." menu categories
   nav_row "🔥  Top streams right now"        "The biggest live streams on Twitch." menu top
   nav_row "👥  All followed (incl. offline)" "Every channel you follow, live or not." menu follows
@@ -206,6 +207,14 @@ tui_submenu_rows() { # tui_submenu_rows <which>; writes rows to stdout
                   + "\u001f\u001f" + (.title | clean)),
                 "play", .broadcaster_login ] | @tsv'
       ;;
+    gamesearch)
+      local gq; gq="$(ask "Search categories…")"
+      [[ -n $gq ]] || return 1
+      helix "/search/categories?first=100&query=$(printf %s "$gq" | jq -sRr @uri)" | jq -r '
+        .data[]? | [ "📂  " + .name,
+                     (.box_art_url // "-" | sub("\\{width\\}"; "285") | sub("\\{height\\}"; "380")),
+                     .name, "game", .id, .name ] | @tsv'
+      ;;
     categories)
       helix "/games/top?first=100" | jq -r '
         .data[]? | [ "📂  " + .name,
@@ -224,7 +233,8 @@ tui_submenu_rows() { # tui_submenu_rows <which>; writes rows to stdout
 
 submenu_label() { # submenu_label <which>; the prompt shown for that level
   case "$1" in
-    search)     printf 'Twitch · search' ;;
+    search)     printf 'Twitch · channel search' ;;
+    gamesearch) printf 'Twitch · category search' ;;
     categories) printf 'Twitch · categories' ;;
     top)        printf 'Twitch · top' ;;
     follows)    printf 'Twitch · followed' ;;

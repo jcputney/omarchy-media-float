@@ -35,6 +35,8 @@ CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/plex-float"
 INDEX="$CACHE_DIR/index.tsv"
 EPISODES="$CACHE_DIR/episodes.tsv"
 SEASONS="$CACHE_DIR/seasons.tsv"
+LIBRARIES="$CACHE_DIR/libraries.tsv"
+LIBVIEW="$CACHE_DIR/library.tsv"
 SHOW_JSON="$CACHE_DIR/show.json"
 
 # Rebuild the library index if it is older than this many seconds.
@@ -309,7 +311,8 @@ build_index() {
             + (if (.contentRating // "") != "" then "  ·  " + .contentRating else "" end)
             + "\u001f\u001f" + (.summary | clean) ),
           (.ratingKey|tostring),
-          $type ]
+          $type,
+          $lib ]
       | @tsv' >> "$tmp"
   done <<< "$sections"
 
@@ -319,8 +322,38 @@ build_index() {
 
 index_is_stale() {
   [[ ! -s $INDEX ]] && return 0
+  # An index written before the library column existed cannot drive the
+  # library level, so treat the old five-column shape as stale.
+  (( $(head -1 "$INDEX" | awk -F'\t' '{print NF}') < 6 )) && return 0
   local age=$(( $(date +%s) - $(stat -c %Y "$INDEX") ))
   (( age > INDEX_MAX_AGE ))
+}
+
+# ── Library navigation ──────────────────────────────────────────────────────
+# The library list is a grouping of the cached index, so opening the picker
+# still costs nothing. "View all" is the old behaviour: every library at once,
+# which is what you want when you know the title and not where it lives.
+
+pick_library() { # pick_library; echoes "<kind>\t<value>"
+  { awk -F'\t' 'NF >= 6 { n[$6]++; kind[$6] = $5 }
+      END { for (l in n)
+              printf "%s  %s    ·  %d item%s\t-\t%s\u001f\u001f%d items\tlib\t%s\n",
+                     (kind[l] == "show" ? "📺" : "🎬"), l, n[l],
+                     (n[l] == 1 ? "" : "s"), l, n[l], l }' "$INDEX" | sort
+    printf 'View all\t-\tEverything from every library, in one list.\tall\t-\n'
+  } > "$LIBRARIES"
+  [[ -s $LIBRARIES ]] || die "The library index is empty — try: plex-float index"
+  pick "$LIBRARIES" "Plex"
+}
+
+pick_in_library() { # pick_in_library <library|all>; echoes the picked row
+  if [[ $1 == all ]]; then
+    { back_row; cat "$INDEX"; } > "$LIBVIEW"
+    pick "$LIBVIEW" "Plex · everything" back
+  else
+    { back_row; awk -F'\t' -v lib="$1" '$6 == lib' "$INDEX"; } > "$LIBVIEW"
+    pick "$LIBVIEW" "Plex · $1" back
+  fi
 }
 
 # ── Show navigation ─────────────────────────────────────────────────────────
@@ -507,11 +540,21 @@ cmd_session() { # runs detached: plays <ratingKey>, then rolls into the next
 # thing down. Only the library level has nowhere above it: Escape closes there.
 search_tui() { # runs inside the picker window
   load_config
-  local state=library picked rk type kind val show_rk="" season=""
+  local state=libraries picked rk type kind val show_rk="" season="" library=""
   while :; do
     case $state in
+      libraries)
+        picked="$(pick_library)" || return 1
+        IFS=$'\t' read -r kind val <<< "$picked"
+        case "$kind" in
+          lib) library="$val"; state=library ;;
+          all) library=all;    state=library ;;
+          *)   return 1 ;;
+        esac
+        ;;
       library)
-        picked="$(pick "$INDEX" "Plex")" || return 1
+        picked="$(pick_in_library "$library")" || return 1
+        if is_back "$picked"; then state=libraries; continue; fi
         IFS=$'\t' read -r rk type <<< "$picked"
         [[ ${rk:-} =~ ^[0-9]+$ ]] || return 1
         if [[ $type == "show" ]]; then
