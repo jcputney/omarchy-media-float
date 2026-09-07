@@ -518,7 +518,7 @@ case "${1:-browse}" in
   resume)   shift || true; cmd_resume "${1:-status}" ;;
   browse)   shift || true; cmd_browse "${1:-}" ;;
   _browse_tui) cmd_browse_tui ;;
-  _preview) shift || true; render_preview "${1:--}" "${2:--}" ;;
+  _preview) shift || true; render_preview "${1:--}" "${2:--}" "${3:-}" ;;
   play)     shift; ensure_token; start_stream "${1:?channel login required}" ;;
   quality)  shift || true; cmd_quality "${1:-toggle}" ;;
   toggle)   cmd_toggle ;;

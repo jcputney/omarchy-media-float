@@ -698,7 +698,7 @@ case "${1:-search}" in
     # Plex needs the token on the poster request, but the cached index must not
     # carry it, so it is attached here at render time.
     [[ $thumb == /* ]] && thumb="$PLEX_URL$thumb?X-Plex-Token=$PLEX_TOKEN"
-    render_preview "$thumb" "${2:--}"
+    render_preview "$thumb" "${2:--}" "${3:-}"
     ;;
   toggle)   cmd_toggle ;;
   quit)     cmd_quit ;;
