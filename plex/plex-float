@@ -258,6 +258,19 @@ cmd_server() { # cmd_server [name|--url <url>|--list]
   printf '\nChange it with: plex-float server "<name>"   (or --url, or --list)\n'
 }
 
+# A Plex server is normally on the LAN, so its address is private by design and
+# the public-address rule cannot apply here. What replaces it is stricter: the
+# only authority this fetch may ever touch is the configured server. A redirect
+# to anywhere else is refused rather than followed, because the request carries
+# the token in a header and curl forwards custom headers across origins.
+FETCH_REQUIRE_PUBLIC=0
+
+fetch_guard() { # fetch_guard <url>
+  local url="${1:-}"
+  [[ -n ${PLEX_URL:-} ]] || return 1
+  [[ $url == "$PLEX_URL"/* ]]
+}
+
 # The picker asks for one poster at a time, for the row it is showing. The
 # token rides in a header and never reaches a URL, and the answer is a path
 # inside our own cache — that is all the overlay is given.

@@ -162,11 +162,16 @@ helix() { # helix <path-with-query>
   | head -c "$API_MAX_BYTES"
 }
 
-# Twitch serves every image — stream previews, box art, avatars — from one CDN.
+# Twitch serves every image — stream previews, box art, avatars — from one CDN,
+# and a preview for a stream that just went offline redirects to a placeholder
+# on that same host, so redirects have to be followed rather than refused. This
+# is asked again about every hop, so following one cannot leave the CDN.
+fetch_guard() { # fetch_guard <url>
+  host_allowed "${1:-}" static-cdn.jtvnw.net
+}
+
 resolve_image() { # resolve_image <url>; echoes a local file
-  local url="${1:-}"
-  host_allowed "$url" static-cdn.jtvnw.net || return 1
-  cache_image "$url" --proto '=https'
+  cache_image "${1:-}"
 }
 
 user_id() {
