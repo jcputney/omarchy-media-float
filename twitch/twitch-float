@@ -501,7 +501,7 @@ cmd_browse_tui() {
 cmd_browse() { # cmd_browse [--resume]
   local login
   [[ ${1:-} == --resume ]] && export TWF_RESUME=1
-  login="$(run_menu "$SELF _browse_tui")"
+  login="$(run_menu "$SELF" _browse_tui)"
   [[ -n $login ]] || exit 0
   ensure_token
   start_stream "$login" browse

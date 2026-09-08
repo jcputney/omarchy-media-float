@@ -801,7 +801,7 @@ cmd_search() { # cmd_search [--resume]
   fi
 
   local rk
-  rk="$(run_menu "$SELF _search_tui")"
+  rk="$(run_menu "$SELF" _search_tui)"
   [[ ${rk:-} =~ ^[0-9]+$ ]] || exit 0
 
   stop_existing
