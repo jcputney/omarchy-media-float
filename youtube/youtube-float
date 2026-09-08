@@ -412,7 +412,12 @@ cmd_browse() { # cmd_browse [--resume]
 
 # ── Playback ────────────────────────────────────────────────────────────────
 
-height() { cat "$QUALITY_FILE" 2>/dev/null || echo "$DEFAULT_HEIGHT"; }
+# It is spliced into a yt-dlp format selector and handed to mpv. Ours to write,
+# so ours to check; anything else falls back to the default.
+height() {
+  local h; h="$(cat "$QUALITY_FILE" 2>/dev/null | head -1 || true)"
+  [[ $h == "best" || $h =~ ^[0-9]{2,5}$ ]] && printf '%s' "$h" || printf '%s' "$DEFAULT_HEIGHT"
+}
 
 ytdl_format() {
   local h; h="$(height)"
@@ -473,6 +478,8 @@ cmd_play() { # cmd_play <id|url>
 cmd_quality() { # cmd_quality <720|best|toggle>
   local want="${1:-toggle}" cur; cur="$(height)"
   [[ $want == "toggle" ]] && { [[ $cur == "best" ]] && want="$DEFAULT_HEIGHT" || want="best"; }
+  [[ $want == "best" || $want =~ ^[0-9]{2,5}$ ]] \
+    || die "Not a video height: $want (try best, or a number like 720)"
   printf '%s\n' "$want" > "$QUALITY_FILE"
   note "YouTube quality: $([[ $want == best ]] && echo "source" || echo "${want}p")"
 

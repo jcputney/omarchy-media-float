@@ -509,10 +509,31 @@ cmd_browse() { # cmd_browse [--resume]
 
 # ── Playback ────────────────────────────────────────────────────────────────
 
-quality() { cat "$QUALITY_FILE" 2>/dev/null || echo "$DEFAULT_QUALITY"; }
+# A stream selector becomes a streamlink argument, so it is checked on the way
+# in and on the way out. Being alphanumeric is not enough: `status` is a
+# perfectly ordinary word and a meaningless stream, and a file holding one is
+# how a mistyped command becomes a stream that will not start.
+valid_quality() { # valid_quality <selector-list>
+  local q="${1:-}" part
+  [[ -n $q && ${#q} -le 64 ]] || return 1
+  local IFS=,
+  for part in $q; do
+    [[ $part =~ ^(best|worst|audio_only|[0-9]{3,4}p[0-9]{0,3})$ ]] || return 1
+  done
+  return 0
+}
+
+quality() {
+  local q; q="$(cat "$QUALITY_FILE" 2>/dev/null | head -1 || true)"
+  valid_quality "$q" && printf '%s' "$q" || printf '%s' "$DEFAULT_QUALITY"
+}
 
 start_stream() { # start_stream <login> [browse]
   [[ -n ${1:-} ]] || exit 0
+  # It goes into a Helix query string and into the address streamlink opens.
+  # A Twitch login is letters, digits and underscores; anything else is not a
+  # channel, whatever the API said.
+  [[ $1 =~ ^[A-Za-z0-9_]{1,32}$ ]] || die "Not a Twitch channel name: $1"
   # Offline channels are reachable from the "All followed" list, and streamlink
   # simply finds no streams and exits, leaving no window and no explanation.
   # Ask Helix first so there is something to say.
@@ -526,6 +547,7 @@ start_stream() { # start_stream <login> [browse]
 
 cmd_session() { # cmd_session <login> [browse]
   local login="$1" from="${2:-}" mpv_pid
+  [[ $login =~ ^[A-Za-z0-9_]{1,32}$ ]] || die "Not a Twitch channel name: $login"
   echo "$$" > "$PID_FILE"
   # setsid gives this session its own process group, so killing the group on the
   # way out takes streamlink with it.
@@ -567,6 +589,8 @@ cmd_quality() {
     toggle) if [[ $cur == best ]]; then want="$DEFAULT_QUALITY"; else want=best; fi ;;
     source) want=best ;;
   esac
+  valid_quality "$want" \
+    || die "Not a stream quality: $want (try best, source, 720p, 720p60, or a comma-separated list)"
   printf '%s\n' "$want" > "$QUALITY_FILE"
   note "Quality: $want"
   # Restart the current channel so the change takes effect now — but only if the

@@ -115,6 +115,22 @@ num_or() { # num_or <value> <default>
   [[ ${1:-} =~ ^[0-9]{1,9}$ ]] && printf '%s' "$1" || printf '%s' "${2:-0}"
 }
 
+# A value that becomes part of a query string. Anything outside this set could
+# end the parameter and begin another one, which is a different request from
+# the one being made.
+url_safe() { # url_safe <value>
+  [[ ${1:-} =~ ^[A-Za-z0-9._~-]{1,128}$ ]]
+}
+
+# A path a remote response asked for. It has to stay under the root it was
+# given: no climbing out, no query of its own, nothing that ends an argument.
+valid_path_ref() { # valid_path_ref <path>
+  local r="${1:-}"
+  [[ $r == /* && ${#r} -le 512 ]] || return 1
+  [[ $r != *".."* ]] || return 1
+  [[ $r =~ ^[A-Za-z0-9._~/%+-]+$ ]]
+}
+
 valid_token() { # valid_token <value>
   local t="${1:-}"
   (( ${#t} > 0 && ${#t} <= TOKEN_MAX_LEN )) || return 1
