@@ -41,13 +41,16 @@ build() { # build <slug>
   cp "$ROOT/core/setup" "$out/setup"
   cp "$ROOT/LICENSE" "$out/LICENSE"
   cp "$src/README.md" "$out/README.md"
+  # setup installs this into ~/.local/share/applications so the tool has a
+  # launcher entry, not just a keybinding you have to write yourself.
+  cp "$src/app.desktop" "$out/app.desktop"
   # The marketplace picks up a root preview automatically; optional, so only
   # copy one when the tool has it.
   [[ -f $src/preview.png ]] && cp "$src/preview.png" "$out/preview.png"
 
   chmod 755 "$out/setup" "$out/bin/"* "$out/lib/"*
   chmod 644 "$out/manifest.json" "$out/Picker.qml" "$out/hypr/media-float.lua" \
-            "$out/LICENSE" "$out/README.md"
+            "$out/LICENSE" "$out/README.md" "$out/app.desktop"
   [[ -f $out/preview.png ]] && chmod 644 "$out/preview.png"
 
   # The same check `omarchy plugin add` runs before it will install anything.
