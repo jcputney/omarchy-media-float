@@ -153,8 +153,8 @@ cmd_auth() {
 # listed rather than just the best, because plex.tv reports docker and VPN
 # addresses as "local" and those are often unreachable from here.
 list_servers() {
+  local FETCH_CURL_CONFIG; FETCH_CURL_CONFIG="$(plex_auth)"
   plextv GET "/api/v2/resources?includeHttps=1&includeRelay=1" \
-    -H "X-Plex-Token: ${PLEX_TOKEN:?}" \
     | jq -r '
         .[] | select((.provides // "") | test("server"))
         | . as $s
@@ -178,8 +178,9 @@ reachable_servers() { # reachable_servers <rows-file>
     i=$(( i + 1 ))
     (
       local uri="${row##*$'\t'}"
-      curl -fsS --connect-timeout 3 --max-time 5 --max-filesize 65536 -o /dev/null \
-        -H "X-Plex-Token: $PLEX_TOKEN" "$uri/identity" 2>/dev/null \
+      plex_auth \
+      | curl -fsS -K - --connect-timeout 3 --max-time 5 --max-filesize 65536 \
+          -o /dev/null "$uri/identity" 2>/dev/null \
         && printf '%s\n' "$row" > "$tmp/$(printf '%04d' "$i")"
     ) &
   done < "$1"
@@ -258,6 +259,10 @@ cmd_server() { # cmd_server [name|--url <url>|--list]
   printf '\nChange it with: plex-float server "<name>"   (or --url, or --list)\n'
 }
 
+# The token never appears in a command line. printf is a shell builtin, so
+# building this forks nothing whose arguments could be read from /proc.
+plex_auth() { printf 'header = "X-Plex-Token: %s"\n' "${PLEX_TOKEN:?}"; }
+
 # A Plex server is normally on the LAN, so its address is private by design and
 # the public-address rule cannot apply here. What replaces it is stricter: the
 # only authority this fetch may ever touch is the configured server. A redirect
@@ -278,16 +283,17 @@ resolve_image() { # resolve_image <thumb-path>; echoes a local file
   local ref="${1:-}"
   [[ $ref == /* && $ref != *".."* ]] || return 1
   load_config
-  cache_image "$PLEX_URL$ref" -H "X-Plex-Token: $PLEX_TOKEN"
+  local FETCH_CURL_CONFIG; FETCH_CURL_CONFIG="$(plex_auth)"
+  cache_image "$PLEX_URL$ref"
 }
 
 api() {
   # A full library listing is the biggest thing this tool reads, so it gets the
   # longer deadline; the byte ceiling around it is the shared one.
   local FETCH_MAX_TIME=25
+  local FETCH_CURL_CONFIG; FETCH_CURL_CONFIG="$(plex_auth)"
   bounded_body "$PLEX_URL$1" \
     -H "Accept: application/json" \
-    -H "X-Plex-Token: $PLEX_TOKEN" \
     -H "X-Plex-Client-Identifier: $CLIENT_ID" \
     -H "X-Plex-Product: plex-float" \
     -H "X-Plex-Version: 1.0" \
@@ -568,8 +574,20 @@ play_one() { # play_one <ratingKey>; returns 0 if it played to the end
   rm -f "$SOCKET"
   echo 0 > "$POS_FILE"
 
-  mpv "${OVERLAY_MPV_ARGS[@]}" "$PLEX_URL$part?X-Plex-Token=$PLEX_TOKEN" >/dev/null 2>&1 &
+  # A URL is the worst place for a credential: it is in argv, it reaches mpv's
+  # log and window title, and it outlives the request in anything keeping a
+  # history. mpv reads the header from a private config file instead, and the
+  # URL goes back to being just a URL.
+  # A Plex part is a direct file URL, so mpv never needs a resolver for it.
+  # Without this, a request mpv cannot decode falls back to yt-dlp, which does
+  # not inherit the header and so retries the URL unauthenticated.
+  OVERLAY_MPV_ARGS+=(--no-ytdl)
+  local mpvconf="$RUN_DIR/plex-mpv.conf"
+  ( umask 077; printf 'http-header-fields=X-Plex-Token: %s\n' "${PLEX_TOKEN:?}" > "$mpvconf" )
+  mpv --include="$mpvconf" "${OVERLAY_MPV_ARGS[@]}" "$PLEX_URL$part" >/dev/null 2>&1 &
   mpv_pid=$!
+  # mpv has read it long before this; the file is not needed again.
+  ( sleep 10; rm -f "$mpvconf" ) >/dev/null 2>&1 &
 
   scrobble_loop "$rk" "$dur" "$mpv_pid" &
   scrobble_pid=$!
