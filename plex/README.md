@@ -51,6 +51,13 @@ get the fast path when you are on the same network as the server.
 Already have a `~/.config/plex-float/config` with `PLEX_URL` and `PLEX_TOKEN`?
 It still wins. Nothing overwrites it.
 
+One thing to know if you wrote that file some time ago: it is read as text now,
+not run as a shell script. Plain `KEY=value` lines work exactly as before, with
+or without quotes. A line that computed its value — `PLEX_TOKEN=$(pass show
+plex)`, say — no longer does, because a config file is data and this stopped
+executing it. Put the literal value in, or export the variable in your shell
+before you start the tool.
+
 ## Use it
 
 ```bash

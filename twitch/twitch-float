@@ -47,10 +47,14 @@ mkdir -p "$CONFIG_DIR" "$CACHE_DIR"
 DEFAULT_CLIENT_ID="b9wf8ty2oka25ics0gduepoq9kssch"
 
 load_config() {
-  # shellcheck source=/dev/null
-  [[ -f $CONFIG ]] && source "$CONFIG"
-  TWITCH_CLIENT_ID="${TWITCH_CLIENT_ID:-$DEFAULT_CLIENT_ID}"
+  # Shell-shaped because that is what people expect to write, read as text
+  # because reading a file is not a reason to run it.
+  local id=""
+  [[ -f $CONFIG ]] && id="$(conf_value "$CONFIG" TWITCH_CLIENT_ID || true)"
+  TWITCH_CLIENT_ID="${id:-${TWITCH_CLIENT_ID:-$DEFAULT_CLIENT_ID}}"
   [[ -n $TWITCH_CLIENT_ID ]] || die "TWITCH_CLIENT_ID is empty; set it in $CONFIG"
+  # It is not a secret, but it is a header value and a form field all the same.
+  valid_token "$TWITCH_CLIENT_ID" || die "TWITCH_CLIENT_ID is not a Client ID; check $CONFIG"
 }
 
 # ── The token file ──────────────────────────────────────────────────────────
@@ -59,16 +63,24 @@ load_config() {
 # metacharacter in it was therefore a command, and the expiry went into shell
 # arithmetic, which evaluates too. JSON is data: jq writes it with everything
 # quoted, and reading it back never executes anything.
+#
+# Storing it safely is only half of it. These values go on to be interpolated
+# into curl config syntax, where a quote or a newline would close the value and
+# begin a fresh directive attached to a request already carrying the
+# credential. Nothing is escaped for that: a token is checked against the shape
+# a real one has, and refused if it does not fit.
 
 save_tokens() { # save_tokens <access> <refresh> <expires_in>
-  local expires_in="${3:-3600}"
-  # A duration from a remote response that is not a plain number is not a
-  # duration. It used to go straight into $(( )).
-  [[ $expires_in =~ ^[0-9]+$ ]] || expires_in=3600
-  umask 077
-  jq -n --arg a "${1:-}" --arg r "${2:-}" \
+  local expires_in refresh
+  expires_in="$(num_or "${3:-}" 3600)"
+  valid_token "${1:-}" || die "Twitch returned an access token in an unexpected form"
+  # A refresh token is optional. An unusable one is dropped rather than stored,
+  # so the next run asks for a fresh sign-in instead of feeding it to curl.
+  refresh="${2:-}"
+  valid_token "$refresh" || refresh=""
+  jq -n --arg a "$1" --arg r "$refresh" \
         --argjson e "$(( $(date +%s) + expires_in ))" \
-        '{access: $a, refresh: $r, expires: $e}' > "$TOKENS"
+        '{access: $a, refresh: $r, expires: $e}' | private_write "$TOKENS"
 }
 
 # A file written before 0.8.2 is the old shell format. It is read as text —
@@ -76,25 +88,31 @@ save_tokens() { # save_tokens <access> <refresh> <expires_in>
 # is not needed.
 migrate_tokens() {
   [[ -s $TOKENS ]] || return 1
-  jq -e 'type == "object"' "$TOKENS" >/dev/null 2>&1 && return 0
+  private_read "$TOKENS" 2>/dev/null | jq -e 'type == "object"' >/dev/null 2>&1 \
+    && return 0
   local a r e
-  a="$(sed -n 's/^TWITCH_ACCESS_TOKEN=//p'  "$TOKENS" | head -1)"
-  r="$(sed -n 's/^TWITCH_REFRESH_TOKEN=//p' "$TOKENS" | head -1)"
-  e="$(sed -n 's/^TWITCH_TOKEN_EXPIRES=//p' "$TOKENS" | head -1)"
-  [[ -n $a ]] || return 1
-  [[ $e =~ ^[0-9]+$ ]] || e=0
-  umask 077
+  a="$(conf_value "$TOKENS" TWITCH_ACCESS_TOKEN || true)"
+  r="$(conf_value "$TOKENS" TWITCH_REFRESH_TOKEN || true)"
+  e="$(conf_value "$TOKENS" TWITCH_TOKEN_EXPIRES || true)"
+  valid_token "$a" || return 1
+  valid_token "$r" || r=""
+  e="$(num_or "$e" 0)"
   jq -n --arg a "$a" --arg r "$r" --argjson e "$e" \
-        '{access: $a, refresh: $r, expires: $e}' > "$TOKENS"
+        '{access: $a, refresh: $r, expires: $e}' | private_write "$TOKENS"
 }
 
 load_tokens() {
   migrate_tokens || return 1
-  TWITCH_ACCESS_TOKEN="$(jq -r '.access  // empty' "$TOKENS" 2>/dev/null)"
-  TWITCH_REFRESH_TOKEN="$(jq -r '.refresh // empty' "$TOKENS" 2>/dev/null)"
-  TWITCH_TOKEN_EXPIRES="$(jq -r '.expires // 0'     "$TOKENS" 2>/dev/null)"
-  [[ $TWITCH_TOKEN_EXPIRES =~ ^[0-9]+$ ]] || TWITCH_TOKEN_EXPIRES=0
-  [[ -n $TWITCH_ACCESS_TOKEN ]]
+  local j; j="$(private_read "$TOKENS" 2>/dev/null || true)"
+  jq -e 'type == "object"' <<< "${j:-}" >/dev/null 2>&1 || return 1
+  TWITCH_ACCESS_TOKEN="$(jq -r '.access  // empty' <<< "$j")"
+  TWITCH_REFRESH_TOKEN="$(jq -r '.refresh // empty' <<< "$j")"
+  TWITCH_TOKEN_EXPIRES="$(num_or "$(jq -r '.expires // 0' <<< "$j")" 0)"
+  # A stored value still has to be usable before it is put anywhere. Anything
+  # that fails here is treated as not being signed in.
+  valid_token "$TWITCH_ACCESS_TOKEN" || return 1
+  valid_token "$TWITCH_REFRESH_TOKEN" || TWITCH_REFRESH_TOKEN=""
+  return 0
 }
 
 # ── Auth (device code flow) ─────────────────────────────────────────────────
@@ -108,11 +126,17 @@ cmd_auth() {
   [[ -n $resp ]] \
     || die "Could not start device authorization — is the Client ID right, and the app set to Public?"
 
-  device_code="$(jq -r '.device_code' <<< "$resp")"
-  user_code="$(jq -r '.user_code' <<< "$resp")"
-  verify="$(jq -r '.verification_uri' <<< "$resp")"
-  interval="$(jq -r '.interval // 5' <<< "$resp")"
-  expires="$(jq -r '.expires_in // 1800' <<< "$resp")"
+  # The device code goes into a curl config, the verification address goes to
+  # a browser, and the two counts go into shell arithmetic and a sleep. None of
+  # them is trusted for being in the response.
+  device_code="$(jq -r '.device_code // empty' <<< "$resp")"
+  valid_token "$device_code" || die "Twitch returned a device code in an unexpected form"
+  user_code="$(safe_text "$(jq -r '.user_code // empty' <<< "$resp")")"
+  verify="$(jq -r '.verification_uri // empty' <<< "$resp")"
+  host_allowed "$verify" twitch.tv \
+    || die "Twitch pointed the sign-in somewhere unexpected, so it was not opened"
+  interval="$(num_or "$(jq -r '.interval // 5' <<< "$resp")" 5)"
+  expires="$(num_or "$(jq -r '.expires_in // 1800' <<< "$resp")" 1800)"
 
   printf '\n  Open:  %s\n  Code:  %s\n\n  Waiting for you to approve…\n\n' "$verify" "$user_code"
   note "Enter code $user_code at $verify"
@@ -172,8 +196,9 @@ ensure_token() {
   # Refresh a minute before expiry so a long browse never dies mid-request.
   if (( $(date +%s) >= ${TWITCH_TOKEN_EXPIRES:-0} - 60 )); then
     local resp token
+    [[ -n ${TWITCH_REFRESH_TOKEN:-} ]] || die "Session expired. Run: twitch-float auth"
     resp="$(printf 'data-urlencode = "grant_type=refresh_token"\ndata-urlencode = "refresh_token=%s"\n' \
-      "${TWITCH_REFRESH_TOKEN:-}" | oauth_post /token)" || true
+      "$TWITCH_REFRESH_TOKEN" | oauth_post /token)" || true
     token="$(jq -r '.access_token // empty' <<< "${resp:-}")"
     [[ -n $token ]] || die "Session expired. Run: twitch-float auth"
     save_tokens "$token" \
@@ -185,6 +210,8 @@ ensure_token() {
 
 helix() { # helix <path-with-query>
   local API_MAX_BYTES=4194304
+  valid_token "${TWITCH_ACCESS_TOKEN:?}" \
+    || die "The saved Twitch token is not in a form this can use — run: twitch-float auth"
   printf 'header = "Authorization: Bearer %s"\n' "$TWITCH_ACCESS_TOKEN" \
   | curl -fsS -K - \
       --connect-timeout "$FETCH_CONNECT_TIMEOUT" \

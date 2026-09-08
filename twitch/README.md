@@ -54,6 +54,10 @@ redirect `http://localhost` and type **Public**, then:
 echo 'TWITCH_CLIENT_ID=your_id_here' >> ~/.config/twitch-float/config
 ```
 
+That file is read as text, not run as a shell script, so a plain `KEY=value`
+line is all it understands. A line that computed its value used to work because
+the file was sourced; it no longer does, and that is the point.
+
 ## Use it
 
 ```bash

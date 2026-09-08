@@ -46,26 +46,78 @@ INDEX_MAX_AGE=86400
 
 mkdir -p "$CONFIG_DIR" "$CACHE_DIR"
 
+# ── The token store ─────────────────────────────────────────────────────────
+# It holds an account token and a server address and name that came from the
+# plex.tv resources response. That is remote text, and it used to be written as
+# shell assignments into a file this script then sourced, which made a server
+# name a place to put commands. It is JSON now: jq quotes every value on the
+# way in, jq reads them back out, and nothing here executes a stored file.
+
+# The address is a curl argument and the prefix every authenticated request is
+# checked against, so it has to be an authority and nothing else — no path to
+# graft a different endpoint onto, no space to end an argument.
+valid_server_url() { # valid_server_url <url>
+  [[ ${1:-} =~ ^https?://(\[[0-9A-Fa-f:]+\]|[A-Za-z0-9._~-]+)(:[0-9]{1,5})?$ ]]
+}
+
+migrate_tokens() {
+  [[ -f $TOKENS ]] || return 0
+  private_read "$TOKENS" 2>/dev/null | jq -e 'type == "object"' >/dev/null 2>&1 \
+    && return 0
+  # The old shell-shaped file is read as text, never sourced — the same reason
+  # the format is being left behind in the first place.
+  local tok url name
+  tok="$(conf_value "$TOKENS" PLEX_TOKEN || true)"
+  url="$(conf_value "$TOKENS" PLEX_URL || true)"
+  name="$(conf_value "$TOKENS" PLEX_SERVER_NAME || true)"
+  [[ -n $tok ]] || return 0
+  jq -n --arg t "$tok" --arg u "$url" --arg n "$(safe_text "$name")" \
+     '{token: $t, url: $u, name: $n}' | private_write "$TOKENS"
+}
+
+stored_json() { # the store as JSON, or an empty object
+  migrate_tokens
+  local j; j="$(private_read "$TOKENS" 2>/dev/null || true)"
+  if jq -e 'type == "object"' <<< "${j:-}" >/dev/null 2>&1; then
+    printf '%s' "$j"
+  else
+    printf '{}'
+  fi
+}
+
+read_tokens() { # sets PLEX_TOKEN, PLEX_URL and PLEX_SERVER_NAME from the store
+  local j; j="$(stored_json)"
+  PLEX_TOKEN="$(jq -r '.token // empty' <<< "$j")"
+  PLEX_URL="$(jq -r '.url   // empty' <<< "$j")"
+  PLEX_SERVER_NAME="$(jq -r '.name  // empty' <<< "$j")"
+}
+
 load_config() {
-  # `auth` writes tokens; a hand-written config still wins, so an existing
-  # setup keeps working untouched.
-  # shellcheck source=/dev/null
-  [[ -f $TOKENS ]] && source "$TOKENS"
-  local discovered="${PLEX_URL:-}"
-  # Clear both names first: the config may set the PLEX_HOST alias, and leaving
-  # the discovered PLEX_URL in place would win the fallback chain below and
-  # silently override it.
-  PLEX_URL="" PLEX_HOST=""
-  # shellcheck source=/dev/null
-  [[ -f $CONFIG ]] && source "$CONFIG"
-  # PLEX_HOST is accepted as an alias for PLEX_URL.
-  PLEX_URL="${PLEX_URL:-${PLEX_HOST:-$discovered}}"
+  # `auth` writes the store; a hand-written config still wins, so an existing
+  # setup keeps working untouched. It is shell-shaped because that is what
+  # people expect to write, but it is read as text: a value in it is a value,
+  # never a command.
+  local discovered cfg_token="" cfg_url=""
+  read_tokens
+  discovered="${PLEX_URL:-}"
+  if [[ -f $CONFIG ]]; then
+    cfg_token="$(conf_value "$CONFIG" PLEX_TOKEN || true)"
+    cfg_url="$(conf_value "$CONFIG" PLEX_URL || true)"
+    # PLEX_HOST is accepted as an alias for PLEX_URL.
+    [[ -n $cfg_url ]] || cfg_url="$(conf_value "$CONFIG" PLEX_HOST || true)"
+  fi
+  [[ -n $cfg_token ]] && PLEX_TOKEN="$cfg_token"
+  PLEX_URL="${cfg_url:-$discovered}"
   [[ -n ${PLEX_TOKEN:-} ]] || die "Not signed in to Plex yet — run: plex-float auth"
+  valid_token "$PLEX_TOKEN" \
+    || die "The saved Plex token is not in a form this can use — run: plex-float auth"
   [[ -n $PLEX_URL ]] || die "No Plex server chosen yet — run: plex-float server"
   # Accept a bare host, a host:port, or a full URL.
   [[ $PLEX_URL == *://* ]] || PLEX_URL="http://$PLEX_URL"
   [[ ${PLEX_URL#*://} == *:* ]] || PLEX_URL="$PLEX_URL:32400"
   PLEX_URL="${PLEX_URL%/}"
+  valid_server_url "$PLEX_URL" \
+    || die "The saved Plex address is not a plain server address — run: plex-float server"
   # The cached index stores bare thumb paths, and they stay bare all the way to
   # the picker. Putting the token in the poster URL kept it out of the index but
   # put it somewhere worse: an image loader's request line, its cache, and any
@@ -81,14 +133,17 @@ load_config() {
 # user approves it in a browser, and polling the pin returns an auth token.
 
 client_id() {
-  if [[ ! -s $CLIENT_ID_FILE ]]; then
-    # The token plex.tv issues is bound to the identifier that asked for it, so
-    # this has to be stable across runs.
-    umask 077
-    printf 'plex-float-%s\n' \
-      "$(od -An -tx1 -N16 /dev/urandom | tr -d ' \n')" > "$CLIENT_ID_FILE"
+  # The token plex.tv issues is bound to the identifier that asked for it, so
+  # this has to be stable across runs. It is also a header value, so what comes
+  # back off disk is checked for shape rather than trusted: anything else is
+  # replaced, which costs a re-auth and nothing more.
+  local id
+  id="$(private_read "$CLIENT_ID_FILE" 2>/dev/null | head -1 || true)"
+  if [[ ! $id =~ ^plex-float-[0-9a-f]{32}$ ]]; then
+    id="plex-float-$(od -An -tx1 -N16 /dev/urandom | tr -d ' \n')"
+    printf '%s\n' "$id" | private_write "$CLIENT_ID_FILE"
   fi
-  cat "$CLIENT_ID_FILE"
+  printf '%s\n' "$id"
 }
 
 plextv() { # plextv <method> <path> [extra curl args…]
@@ -105,18 +160,21 @@ plextv() { # plextv <method> <path> [extra curl args…]
     "$@"
 }
 
-save_token() { umask 077; printf 'PLEX_TOKEN=%s\n' "$1" > "$TOKENS"; }
+save_token() { # save_token <token>
+  valid_token "${1:-}" || die "plex.tv returned a token in an unexpected form"
+  # Merging into whatever is stored keeps the server choice through a re-auth,
+  # which the old rewrite-the-whole-file version quietly dropped.
+  stored_json | jq --arg t "$1" '.token = $t' | private_write "$TOKENS"
+}
 
 save_server() { # save_server <url> [server-name]
-  local tok=""
-  # A bare assignment from a failing pipeline would take the whole script down
-  # under `set -e`, and on a first sign-in there is no tokens file yet.
-  [[ -f $TOKENS ]] && tok="$(sed -n 's/^PLEX_TOKEN=//p' "$TOKENS" | head -1)"
-  tok="${tok:-${PLEX_TOKEN:-}}"
-  umask 077
+  local url="${1%/}"
+  valid_server_url "$url" || die "Not a Plex server address: $url"
   # The name is kept so the address can be re-resolved later, after a DHCP
-  # lease or a remote-access change moves it.
-  printf 'PLEX_TOKEN=%s\nPLEX_URL=%s\nPLEX_SERVER_NAME=%s\n' "$tok" "$1" "${2:-}" > "$TOKENS"
+  # lease or a remote-access change moves it. It is remote text, so it is
+  # stripped of control bytes before it is stored.
+  stored_json | jq --arg u "$url" --arg n "$(safe_text "${2:-}")" \
+    '.url = $u | .name = $n' | private_write "$TOKENS"
 }
 
 cmd_auth() {
@@ -195,10 +253,9 @@ server_label() { # server_label <name> <yours|shared> <local|remote|relay>
 
 cmd_server() { # cmd_server [name|--url <url>|--list]
   if [[ -z ${PLEX_TOKEN:-} ]]; then
-    # shellcheck source=/dev/null
-    [[ -f $TOKENS ]] && source "$TOKENS"
-    # shellcheck source=/dev/null
-    [[ -f $CONFIG ]] && source "$CONFIG"
+    read_tokens
+    local cfg_token; cfg_token="$(conf_value "$CONFIG" PLEX_TOKEN 2>/dev/null || true)"
+    [[ -n $cfg_token ]] && PLEX_TOKEN="$cfg_token"
   fi
   [[ -n ${PLEX_TOKEN:-} ]] || die "Not signed in to Plex yet — run: plex-float auth"
 
@@ -261,7 +318,15 @@ cmd_server() { # cmd_server [name|--url <url>|--list]
 
 # The token never appears in a command line. printf is a shell builtin, so
 # building this forks nothing whose arguments could be read from /proc.
-plex_auth() { printf 'header = "X-Plex-Token: %s"\n' "${PLEX_TOKEN:?}"; }
+plex_auth() {
+  # A quote or a newline here would close the value and start a fresh curl
+  # directive, in a config attached to a request that carries the credential.
+  # Nothing is escaped for that syntax; a value that would need escaping is
+  # refused instead.
+  valid_token "${PLEX_TOKEN:?}" \
+    || die "The saved Plex token is not in a form this can use — run: plex-float auth"
+  printf 'header = "X-Plex-Token: %s"\n' "$PLEX_TOKEN"
+}
 
 # A Plex server is normally on the LAN, so its address is private by design and
 # the public-address rule cannot apply here. What replaces it is stricter: the
@@ -583,7 +648,8 @@ play_one() { # play_one <ratingKey>; returns 0 if it played to the end
   # not inherit the header and so retries the URL unauthenticated.
   OVERLAY_MPV_ARGS+=(--no-ytdl)
   local mpvconf="$RUN_DIR/plex-mpv.conf"
-  ( umask 077; printf 'http-header-fields=X-Plex-Token: %s\n' "${PLEX_TOKEN:?}" > "$mpvconf" )
+  printf 'http-header-fields=X-Plex-Token: %s\n' "${PLEX_TOKEN:?}" \
+    | private_write "$mpvconf"
   mpv --include="$mpvconf" "${OVERLAY_MPV_ARGS[@]}" "$PLEX_URL$part" >/dev/null 2>&1 &
   mpv_pid=$!
   # mpv has read it long before this; the file is not needed again.
