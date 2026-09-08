@@ -69,9 +69,8 @@ cmd_auth() {
   load_config
   local resp device_code user_code verify interval expires waited token err
 
-  resp="$(curl -fsS -X POST "https://id.twitch.tv/oauth2/device" \
-    --data-urlencode "client_id=$TWITCH_CLIENT_ID" \
-    --data-urlencode "scopes=$SCOPES")" \
+  resp="$(printf 'data-urlencode = "scopes=%s"\n' "$SCOPES" | oauth_post /device)" || true
+  [[ -n $resp ]] \
     || die "Could not start device authorization — is the Client ID right, and the app set to Public?"
 
   device_code="$(jq -r '.device_code' <<< "$resp")"
@@ -88,10 +87,8 @@ cmd_auth() {
   while (( waited < expires )); do
     sleep "$interval"
     waited=$(( waited + interval ))
-    resp="$(curl -sS -X POST "https://id.twitch.tv/oauth2/token" \
-      --data-urlencode "client_id=$TWITCH_CLIENT_ID" \
-      --data-urlencode "device_code=$device_code" \
-      --data-urlencode "grant_type=urn:ietf:params:oauth:grant-type:device_code" 2>/dev/null)" || continue
+    resp="$(printf 'data-urlencode = "device_code=%s"\ndata-urlencode = "grant_type=urn:ietf:params:oauth:grant-type:device_code"\n' \
+      "$device_code" | oauth_post /token)" || continue
     token="$(jq -r '.access_token // empty' <<< "$resp")"
     if [[ -n $token ]]; then
       save_tokens "$token" \
@@ -111,6 +108,27 @@ cmd_auth() {
   die "Sign-in timed out — run: twitch-float auth"
 }
 
+# ── Talking to Twitch ───────────────────────────────────────────────────────
+# Anything on a command line is readable from /proc by any process running as
+# this user, for as long as the request takes. So the secret-bearing pieces —
+# the refresh token, the device code, the bearer header — go in as a curl config
+# on stdin instead. printf is a shell builtin, so writing that config never
+# forks a process whose arguments could be read either.
+#
+# Every call is bounded: a connect deadline, a total deadline, and a byte
+# ceiling enforced while the body arrives rather than after it is buffered.
+
+oauth_post() { # oauth_post <path>; secret form fields arrive on stdin
+  local API_MAX_BYTES=1048576
+  curl -sS -K - \
+    --connect-timeout "$FETCH_CONNECT_TIMEOUT" \
+    --max-time "$FETCH_MAX_TIME" \
+    --max-filesize "$API_MAX_BYTES" \
+    -X POST "https://id.twitch.tv/oauth2$1" \
+    --data-urlencode "client_id=$TWITCH_CLIENT_ID" 2>/dev/null \
+  | head -c "$API_MAX_BYTES"
+}
+
 ensure_token() {
   load_config
   [[ -f $TOKENS ]] || die "Not signed in. Run: twitch-float auth"
@@ -121,10 +139,8 @@ ensure_token() {
   # Refresh a minute before expiry so a long browse never dies mid-request.
   if (( $(date +%s) >= ${TWITCH_TOKEN_EXPIRES:-0} - 60 )); then
     local resp token
-    resp="$(curl -sS -X POST "https://id.twitch.tv/oauth2/token" \
-      --data-urlencode "client_id=$TWITCH_CLIENT_ID" \
-      --data-urlencode "grant_type=refresh_token" \
-      --data-urlencode "refresh_token=${TWITCH_REFRESH_TOKEN:-}" 2>/dev/null)" || true
+    resp="$(printf 'data-urlencode = "grant_type=refresh_token"\ndata-urlencode = "refresh_token=%s"\n' \
+      "${TWITCH_REFRESH_TOKEN:-}" | oauth_post /token)" || true
     token="$(jq -r '.access_token // empty' <<< "${resp:-}")"
     [[ -n $token ]] || die "Session expired. Run: twitch-float auth"
     save_tokens "$token" \
@@ -135,10 +151,22 @@ ensure_token() {
 }
 
 helix() { # helix <path-with-query>
-  curl -fsS --max-time 20 \
-    -H "Client-Id: $TWITCH_CLIENT_ID" \
-    -H "Authorization: Bearer $TWITCH_ACCESS_TOKEN" \
-    "https://api.twitch.tv/helix$1"
+  local API_MAX_BYTES=4194304
+  printf 'header = "Authorization: Bearer %s"\n' "$TWITCH_ACCESS_TOKEN" \
+  | curl -fsS -K - \
+      --connect-timeout "$FETCH_CONNECT_TIMEOUT" \
+      --max-time 20 \
+      --max-filesize "$API_MAX_BYTES" \
+      -H "Client-Id: $TWITCH_CLIENT_ID" \
+      "https://api.twitch.tv/helix$1" \
+  | head -c "$API_MAX_BYTES"
+}
+
+# Twitch serves every image — stream previews, box art, avatars — from one CDN.
+resolve_image() { # resolve_image <url>; echoes a local file
+  local url="${1:-}"
+  host_allowed "$url" static-cdn.jtvnw.net || return 1
+  cache_image "$url" --proto '=https'
 }
 
 user_id() {
@@ -519,6 +547,7 @@ case "${1:-browse}" in
   browse)   shift || true; cmd_browse "${1:-}" ;;
   _browse_tui) cmd_browse_tui ;;
   _preview) shift || true; render_preview "${1:--}" "${2:--}" "${3:-}" ;;
+  _thumb)   shift || true; resolve_image "${1:-}" ;;
   play)     shift; ensure_token; start_stream "${1:?channel login required}" ;;
   quality)  shift || true; cmd_quality "${1:-toggle}" ;;
   toggle)   cmd_toggle ;;

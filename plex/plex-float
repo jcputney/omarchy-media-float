@@ -66,11 +66,10 @@ load_config() {
   [[ $PLEX_URL == *://* ]] || PLEX_URL="http://$PLEX_URL"
   [[ ${PLEX_URL#*://} == *:* ]] || PLEX_URL="$PLEX_URL:32400"
   PLEX_URL="${PLEX_URL%/}"
-  # The cached index stores bare thumb paths so the token never lands on disk;
-  # the picker turns them into fetchable URLs at render time.
-  FLOAT_PICKER_IMAGE_PREFIX="$PLEX_URL"
-  FLOAT_PICKER_IMAGE_SUFFIX="?X-Plex-Token=$PLEX_TOKEN"
-  export FLOAT_PICKER_IMAGE_PREFIX FLOAT_PICKER_IMAGE_SUFFIX
+  # The cached index stores bare thumb paths, and they stay bare all the way to
+  # the picker. Putting the token in the poster URL kept it out of the index but
+  # put it somewhere worse: an image loader's request line, its cache, and any
+  # log that records either. resolve_image fetches with a header instead.
   CLIENT_ID="${PLEX_CLIENT_ID:-plex-float-$(hostnamectl --static 2>/dev/null || echo host)}"
   AUTOPLAY_NEXT="${AUTOPLAY_NEXT:-1}"
   # Fraction of the runtime you must reach for an episode to count as finished.
@@ -94,7 +93,8 @@ client_id() {
 
 plextv() { # plextv <method> <path> [extra curl args…]
   local method="$1" path="$2"; shift 2
-  curl -fsS --max-time 20 -X "$method" "https://plex.tv$path" \
+  local API_MAX_BYTES=1048576 FETCH_MAX_TIME=20
+  bounded_body "https://plex.tv$path" -X "$method" \
     -H "Accept: application/json" \
     -H "X-Plex-Client-Identifier: $(client_id)" \
     -H "X-Plex-Product: $PLEX_PRODUCT" \
@@ -178,7 +178,7 @@ reachable_servers() { # reachable_servers <rows-file>
     i=$(( i + 1 ))
     (
       local uri="${row##*$'\t'}"
-      curl -fsS --max-time 5 -o /dev/null \
+      curl -fsS --connect-timeout 3 --max-time 5 --max-filesize 65536 -o /dev/null \
         -H "X-Plex-Token: $PLEX_TOKEN" "$uri/identity" 2>/dev/null \
         && printf '%s\n' "$row" > "$tmp/$(printf '%04d' "$i")"
     ) &
@@ -258,16 +258,28 @@ cmd_server() { # cmd_server [name|--url <url>|--list]
   printf '\nChange it with: plex-float server "<name>"   (or --url, or --list)\n'
 }
 
+# The picker asks for one poster at a time, for the row it is showing. The
+# token rides in a header and never reaches a URL, and the answer is a path
+# inside our own cache — that is all the overlay is given.
+resolve_image() { # resolve_image <thumb-path>; echoes a local file
+  local ref="${1:-}"
+  [[ $ref == /* && $ref != *".."* ]] || return 1
+  load_config
+  cache_image "$PLEX_URL$ref" -H "X-Plex-Token: $PLEX_TOKEN"
+}
+
 api() {
-  curl -fsS --max-time 25 \
+  # A full library listing is the biggest thing this tool reads, so it gets the
+  # longer deadline; the byte ceiling around it is the shared one.
+  local FETCH_MAX_TIME=25
+  bounded_body "$PLEX_URL$1" \
     -H "Accept: application/json" \
     -H "X-Plex-Token: $PLEX_TOKEN" \
     -H "X-Plex-Client-Identifier: $CLIENT_ID" \
     -H "X-Plex-Product: plex-float" \
     -H "X-Plex-Version: 1.0" \
     -H "X-Plex-Device: Linux" \
-    -H "X-Plex-Platform: Hyprland" \
-    "$PLEX_URL$1"
+    -H "X-Plex-Platform: Hyprland"
 }
 
 # ── Library index ───────────────────────────────────────────────────────────
@@ -693,13 +705,9 @@ case "${1:-search}" in
   _search_tui) search_tui ;;
   _preview)
     shift || true
-    load_config
-    thumb="${1:--}"
-    # Plex needs the token on the poster request, but the cached index must not
-    # carry it, so it is attached here at render time.
-    [[ $thumb == /* ]] && thumb="$PLEX_URL$thumb?X-Plex-Token=$PLEX_TOKEN"
-    render_preview "$thumb" "${2:--}" "${3:-}"
+    render_preview "${1:--}" "${2:--}" "${3:-}"
     ;;
+  _thumb) shift || true; resolve_image "${1:-}" ;;
   toggle)   cmd_toggle ;;
   quit)     cmd_quit ;;
   size)     shift || true; cmd_size "${1:-cycle}" ;;
